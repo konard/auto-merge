@@ -34,7 +34,7 @@ function debug(msg) {
 }
 
 // ---------------------
-// Dynamic Imports via use-m for non built in modules
+// Dynamic Imports via use-m for non built-in modules
 // ---------------------
 debug("Importing use-m to enable dynamic module loading...");
 const { use } = eval(await fetch("https://unpkg.com/use-m/use.js").then(u => u.text()));
@@ -75,6 +75,7 @@ if (!["patch", "minor", "major"].includes(bumpType)) {
   process.exit(1);
 }
 
+// Extract owner, repo, and pull request number from the URL.
 const prRegex = /^https:\/\/github\.com\/([^\/]+)\/([^\/]+)\/pull\/(\d+)/;
 const match = prUrl.match(prRegex);
 if (!match) {
@@ -84,6 +85,7 @@ if (!match) {
 const [ , owner, repo, pullNumber ] = match;
 debug(`Parsed PR URL: owner=${owner}, repo=${repo}, pullNumber=${pullNumber}`);
 
+// Common GitHub API headers.
 const headers = {
   Authorization: `token ${token}`,
   Accept: "application/vnd.github.v3+json",
@@ -219,9 +221,6 @@ function sleep(ms) {
 // ---------------------
 // New Helper: Check if PR is Approved
 // ---------------------
-// This function fetches the list of reviews for a PR,
-// aggregates them by reviewer (only keeping the latest review per user),
-// and returns true if at least one (or the required number of) approval(s) is present.
 async function isPRApproved(owner, repo, pullNumber, headers) {
   const reviewsUrl = `https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}/reviews`;
   console.log(`Fetching reviews from: ${reviewsUrl}`);
@@ -232,7 +231,6 @@ async function isPRApproved(owner, repo, pullNumber, headers) {
   const reviews = await response.json();
   const reviewMap = new Map();
   reviews.forEach(review => {
-    // Ensure the review has a submission date
     if (!review.submitted_at) return;
     const username = review.user.login;
     if (!reviewMap.has(username) || new Date(review.submitted_at) > new Date(reviewMap.get(username).submitted_at)) {
@@ -246,7 +244,7 @@ async function isPRApproved(owner, repo, pullNumber, headers) {
     }
   });
   console.log(`Approved reviews count: ${approvedCount}`);
-  const REQUIRED_APPROVALS = 1; // Change this value if your repo requires more approvals
+  const REQUIRED_APPROVALS = 1; // Adjust if more approvals are required
   return approvedCount >= REQUIRED_APPROVALS;
 }
 
@@ -335,54 +333,53 @@ async function handleFailedWorkflows(owner, repo, commitSHA, headers, maxRetries
   let attempt = 0;
   while (attempt <= maxRetries) {
     console.log(`Checking for failed workflows and check runs (attempt ${attempt} of ${maxRetries}) for commit ${commitSHA}...`);
+
     const failedWorkflowRuns = await getFailedWorkflowsForCommit(owner, repo, commitSHA, headers);
     const failedCheckRuns = await getFailedCheckRunsForCommit(owner, repo, commitSHA, headers);
-    
+
+    // Get pending check runs
     const checkRunsResp = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${commitSHA}/check-runs`, { headers });
     const checkRunsData = await checkRunsResp.json();
     const pendingCheckRuns = checkRunsData.check_runs.filter(run => run.status !== "completed");
-    if (failedWorkflowRuns.length === 0 && failedCheckRuns.length === 0 && pendingCheckRuns.length === 0) {
-      console.log("No failed or pending workflow/check runs detected.");
-      return true;
-    }
-    if (pendingCheckRuns.length > 0) {
+
+    if (failedWorkflowRuns.length > 0 || failedCheckRuns.length > 0) {
+      console.log(`Found ${failedWorkflowRuns.length} failed workflow run(s) and ${failedCheckRuns.length} failed check run(s).`);
+      // Re-run failed workflow runs
+      for (const run of failedWorkflowRuns) {
+        console.log(`Requesting re-run for failed workflow run #${run.id} (${run.name})...`);
+        try {
+          await reRunWorkflow(owner, repo, run.id, headers);
+        } catch (err) {
+          console.error(`Error re-running workflow run #${run.id}: ${err.message}`);
+        }
+      }
+      // Re-run failed check suites (by unique check_suite id)
+      const failedCheckSuites = new Set();
+      for (const check of failedCheckRuns) {
+        if (check.check_suite && check.check_suite.id) {
+          failedCheckSuites.add(check.check_suite.id);
+        }
+      }
+      for (const suiteId of failedCheckSuites) {
+        try {
+          await reRunCheckSuite(owner, repo, suiteId, headers);
+        } catch (err) {
+          console.error(`Error re-running check suite ${suiteId}: ${err.message}`);
+        }
+      }
+      console.log("Requested re-run for failed tasks. Waiting 30s for re-run workflows and check suites to start...");
+      await sleep(30000);
+      attempt++;
+      continue;
+    } else if (pendingCheckRuns.length > 0) {
       console.log(`There are ${pendingCheckRuns.length} pending check run(s). Waiting for them to finish...`);
       await sleep(30000);
       attempt++;
       continue;
+    } else {
+      console.log("No failed or pending workflow/check runs detected.");
+      return true;
     }
-    console.log(`Found ${failedWorkflowRuns.length} failed workflow run(s) and ${failedCheckRuns.length} failed check run(s).`);
-    for (const run of failedWorkflowRuns) {
-      console.log(`Downloading logs for failed workflow run #${run.id} (${run.name}).`);
-      try {
-        await downloadWorkflowLogs(owner, repo, run.id, headers);
-      } catch (err) {
-        console.error(`Error downloading logs for workflow run #${run.id}: ${err.message}`);
-      }
-    }
-    const failedCheckSuites = new Set();
-    for (const check of failedCheckRuns) {
-      if (check.check_suite && check.check_suite.id) {
-        failedCheckSuites.add(check.check_suite.id);
-      }
-    }
-    for (const suiteId of failedCheckSuites) {
-      try {
-        await reRunCheckSuite(owner, repo, suiteId, headers);
-      } catch (err) {
-        console.error(`Error re-running check suite ${suiteId}: ${err.message}`);
-      }
-    }
-    for (const run of failedWorkflowRuns) {
-      try {
-        await reRunWorkflow(owner, repo, run.id, headers);
-      } catch (err) {
-        console.error(`Error re-running workflow run #${run.id}: ${err.message}`);
-      }
-    }
-    console.log("Waiting 30s for re-run workflows and check suites to start...");
-    await sleep(30000);
-    attempt++;
   }
   console.error("Max retries reached. Aborting workflow/check re-run attempts. See logs in the 'logs' folder.");
   return false;
@@ -405,14 +402,13 @@ async function waitForPRToBeMergeableWithRetries(owner, repo, pullNum, headers) 
       return false;
     }
 
-    // Check if the PR is approved using our custom function
+    // Check if the PR is approved using our helper function.
     const approved = await isPRApproved(owner, repo, pullNum, headers);
     if (!approved) {
       console.error("Pull request is not approved. Please get approval from someone on the team before merging.");
       return false;
     }
 
-    // Handle mergeable_state and workflows as before
     if (pr.mergeable_state === "blocked" || pr.mergeable_state === "unstable") {
       console.log(`Detected mergeable_state=${pr.mergeable_state}. Attempting to handle failed workflows/checks...`);
       const commitSHA = pr.head.sha;
