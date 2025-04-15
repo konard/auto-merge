@@ -21,15 +21,25 @@
 //   node auto-merge.mjs <pull_request_url> <patch|minor|major>
 
 // ---------------------
+// Utility: Debug Tracing
+// ---------------------
+function debug(msg) {
+  console.log(`[DEBUG] ${msg}`);
+}
+
+// ---------------------
 // Dynamic Imports via use-m for non built-in modules
 // ---------------------
+debug("Importing use-m to enable dynamic module loading...");
 const { use } = eval(
   await fetch('https://unpkg.com/use-m/use.js').then(u => u.text())
 );
 
 // Dynamically import dotenv to load environment variables.
+debug("Importing dotenv module...");
 const dotenv = await use("dotenv");
 dotenv.config();
+debug("Environment variables loaded.");
 
 // ---------------------
 // Built-in modules imported normally
@@ -38,39 +48,23 @@ import { execSync } from "child_process";
 import fs from "fs";
 import readline from "readline";
 
-// Note: We use the built-in global fetch (no external node-fetch required).
-
 // ---------------------
-// Utility: Interactive Confirmation
-// ---------------------
-async function confirmAction(description, commandText) {
-  console.log("\n================================================================================");
-  console.log(`ACTION: ${description}`);
-  console.log(`REPRODUCIBLE COMMAND/API CALL:\n${commandText}`);
-  console.log("================================================================================");
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-  const answer = await new Promise((resolve) => {
-    rl.question("Do you want to continue? (y/n): ", resolve);
-  });
-  rl.close();
-  return answer.toLowerCase().startsWith("y");
-}
-
-// ---------------------
-// Configuration and Input Parsing
+// Check for required environment variable: GITHUB_TOKEN
 // ---------------------
 const token = process.env.GITHUB_TOKEN;
 if (!token) {
   console.error("Error: Please set GITHUB_TOKEN as an environment variable.");
   process.exit(1);
 }
+debug("GITHUB_TOKEN is set.");
 
-// Retrieve command-line arguments.
+// ---------------------
+// Configuration and Input Parsing
+// ---------------------
 const prUrl = process.argv[2];
 const bumpType = process.argv[3];
+
+debug(`Received arguments: prUrl=${prUrl}, bumpType=${bumpType}`);
 
 if (!prUrl || !bumpType) {
   console.error("Usage: node auto-merge.mjs <pull_request_url> <patch|minor|major>");
@@ -90,6 +84,7 @@ if (!match) {
   process.exit(1);
 }
 const [ , owner, repo, pullNumber ] = match;
+debug(`Parsed PR URL: owner=${owner}, repo=${repo}, pullNumber=${pullNumber}`);
 
 // Common GitHub API headers.
 const headers = {
@@ -99,32 +94,60 @@ const headers = {
 };
 
 // ---------------------
+// Utility: Interactive Confirmation
+// ---------------------
+async function confirmAction(description, commandText) {
+  console.log("\n================================================================================");
+  console.log(`ACTION: ${description}`);
+  console.log(`REPRODUCIBLE COMMAND/API CALL:\n${commandText}`);
+  console.log("================================================================================");
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  const answer = await new Promise((resolve) => {
+    rl.question("Do you want to continue? (y/n): ", resolve);
+  });
+  rl.close();
+  debug(`User answer: ${answer}`);
+  return answer.toLowerCase().startsWith("y");
+}
+
+// ---------------------
 // Helper Functions
 // ---------------------
 
 // Runs a shell command after user confirmation if dangerous=true.
 function runCommand(cmd, options = { dangerous: false, description: "" }) {
+  debug(`Preparing to run command: ${cmd}`);
   if (options.dangerous) {
     if (!confirmAction(options.description, cmd)) {
       throw new Error(`Operation aborted by user: ${options.description}`);
     }
   }
   try {
-    return execSync(cmd, { encoding: "utf8", stdio: "pipe" });
+    const output = execSync(cmd, { encoding: "utf8", stdio: "pipe" });
+    debug(`Command output: ${output}`);
+    return output;
   } catch (err) {
+    debug(`Command error output: ${err.message}`);
     throw new Error(`Command failed: ${cmd}\n${err.message}`);
   }
 }
 
 // Fetch package.json from a given branch (using "git show").
 function getPackageJsonFromBranch(branch) {
+  debug(`Fetching package.json from branch: ${branch}`);
   const content = runCommand(`git show origin/${branch}:package.json`);
+  debug(`Fetched package.json content from ${branch}`);
   return JSON.parse(content);
 }
 
 // Read local package.json.
 function getLocalPackageJson() {
+  debug("Reading local package.json file...");
   const content = fs.readFileSync("package.json", "utf8");
+  debug("Successfully read local package.json.");
   return JSON.parse(content);
 }
 
@@ -132,6 +155,7 @@ function getLocalPackageJson() {
 function bumpLocalVersion(bumpType) {
   const cmd = `yarn version --${bumpType}`;
   const description = `This will bump the version in package.json using yarn: ${cmd}`;
+  debug(`Bumping local version with type "${bumpType}"`);
   runCommand(cmd, { dangerous: true, description });
   console.log("Version bump performed.");
 }
@@ -140,6 +164,7 @@ function bumpLocalVersion(bumpType) {
 function pushCurrentBranch(branchName) {
   const cmd = `git push origin ${branchName}`;
   const description = `This will push the branch "${branchName}" to origin with: ${cmd}`;
+  debug(`Pushing current branch ${branchName} to origin.`);
   runCommand(cmd, { dangerous: true, description });
 }
 
@@ -148,13 +173,17 @@ function pushCurrentBranch(branchName) {
 function mergeDefaultBranch(defaultBranch) {
   const mergeCmd = `git merge origin/${defaultBranch} --no-edit`;
   const description = `This will merge origin/${defaultBranch} into the current branch using: ${mergeCmd}`;
+  debug(`Merging default branch (${defaultBranch}) into current branch.`);
   try {
     runCommand(mergeCmd, { dangerous: true, description });
+    debug("Merge succeeded without conflicts.");
     return true; // Merge succeeded.
   } catch (e) {
+    debug("Merge command failed, checking for conflicts...");
     // Check for merge conflicts.
     let conflictsOutput = runCommand(`git diff --name-only --diff-filter=U`);
     const conflicts = conflictsOutput.split(/\n/).map(s => s.trim()).filter(Boolean);
+    debug(`Detected conflicts in files: ${conflicts.join(", ")}`);
     if (conflicts.length === 1 && conflicts[0] === "package.json") {
       const resCmd = `git checkout --theirs package.json && git add package.json && git commit -m "Auto-resolved package.json conflict from merging origin/${defaultBranch}"`;
       if (!confirmAction("Auto-resolving package.json conflict", resCmd)) {
@@ -164,6 +193,7 @@ function mergeDefaultBranch(defaultBranch) {
       runCommand(`git checkout --theirs package.json`, { dangerous: true, description: "Auto-resolve package.json conflict: git checkout --theirs package.json" });
       runCommand(`git add package.json`, { dangerous: true, description: "Staging resolved package.json" });
       runCommand(`git commit -m "Auto-resolved package.json conflict from merging origin/${defaultBranch}"`, { dangerous: true, description: "Committing the conflict resolution" });
+      debug("Auto-resolved package.json conflict.");
       return true;
     } else if (conflicts.length > 0) {
       console.error("Merge conflicts detected in files:", conflicts);
@@ -178,12 +208,14 @@ function mergeDefaultBranch(defaultBranch) {
 function updateDependencies() {
   const cmd = "yarn install";
   const description = `This will update your local yarn.lock and node_modules using: ${cmd}`;
+  debug("Running yarn install to update dependencies.");
   runCommand(cmd, { dangerous: true, description });
   console.log("Local dependencies updated via yarn.");
 }
 
 // Helper to pause execution.
 function sleep(ms) {
+  debug(`Sleeping for ${ms} ms...`);
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
@@ -202,6 +234,7 @@ async function mergePullRequest() {
     throw new Error("User aborted GitHub API merge call.");
   }
 
+  debug(`Sending merge request to GitHub API at ${apiUrl}...`);
   const response = await fetch(apiUrl, {
     method: "PUT",
     headers,
@@ -212,6 +245,7 @@ async function mergePullRequest() {
     const errorData = await response.json();
     throw new Error(`Merge failed: ${errorData.message}`);
   }
+  debug("GitHub API merge successful.");
   return response.json();
 }
 
@@ -222,11 +256,13 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     console.log("\n--- Fetching latest changes from origin ---");
     try {
       runCommand(`git fetch origin ${defaultBranch}`, { dangerous: false, description: "Fetching updates from the default branch" });
+      debug(`Fetched latest changes for branch: ${defaultBranch}`);
     } catch (e) {
       console.error("Failed to fetch the default branch:", e.message);
     }
     // Merge default branch into current branch.
     if (!mergeDefaultBranch(defaultBranch)) {
+      debug("Merge failed or conflicts could not be auto-resolved. Exiting...");
       process.exit(1);
     }
     // Update dependencies after the merge.
@@ -241,6 +277,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     } catch (e) {
       mergeCheck = e.message;
     }
+    debug(`Merge check result: ${mergeCheck}`);
     if (mergeCheck.includes("Already up to date")) {
       console.log("PR branch is up-to-date with the default branch.");
       break;
@@ -256,6 +293,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
 // ---------------------
 (async () => {
   try {
+    debug("Starting main flow...");
     // 1. Get repository details from GitHub API.
     console.log("Fetching repository details...");
     const repoResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers });
@@ -265,6 +303,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     const repoDetails = await repoResponse.json();
     const defaultBranch = repoDetails.default_branch;
     console.log(`Default branch is: ${defaultBranch}`);
+    debug(`Repository details: ${JSON.stringify(repoDetails)}`);
 
     // 2. Setup local PR branch.
     const prBranchName = `pr-${pullNumber}`;
@@ -277,6 +316,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       dangerous: true,
       description: `This will checkout the local PR branch "${prBranchName}".`,
     });
+    debug(`Checked out branch: ${prBranchName}`);
 
     // 3. Compare package.json versions.
     console.log("\nComparing package.json versions between default branch and PR branch...");
@@ -284,6 +324,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     const localPkg = getLocalPackageJson();
     console.log(`Default branch package.json version: ${defaultPkg.version}`);
     console.log(`PR branch package.json version: ${localPkg.version}`);
+    debug(`Default pkg version: ${defaultPkg.version}, Local pkg version: ${localPkg.version}`);
 
     // If the default branch version is greater than the PR branch version, perform a version bump.
     if (defaultPkg.version > localPkg.version) {
@@ -292,6 +333,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       pushCurrentBranch(prBranchName);
     } else {
       console.log("No version bump required (PR branch version is not lower).");
+      debug("Skipping version bump.");
     }
 
     // 4. Periodically sync the PR branch with the default branch,
@@ -304,11 +346,14 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     const mergeResult = await mergePullRequest();
     if (mergeResult.merged) {
       console.log("Pull request merged successfully!");
+      debug("Merge result: " + JSON.stringify(mergeResult));
     } else {
       console.error("Merge failed:", mergeResult.message);
+      debug("Merge result: " + JSON.stringify(mergeResult));
     }
   } catch (error) {
     console.error("Error:", error.message);
+    debug("Script terminating due to error.");
     process.exit(1);
   }
 })();
