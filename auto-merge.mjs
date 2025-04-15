@@ -14,7 +14,7 @@
 //  • Periodically (every 1 minute) the script will sync the PR branch with the default branch.
 //  • Finally, if all conditions pass, the script issues a GitHub API merge call (and prints out a cURL command)
 //    to merge the pull request.
-//  • Optionally, after version bumping (or if the PR was already merged), the script will prompt you to push the new tag.
+//  • Optionally, if the PR is already merged or after a version bump, the script will prompt you to push the new tag to the default branch.
 
 import path from "path";
 import fs from "fs";
@@ -229,9 +229,9 @@ function sleep(ms) {
 }
 
 // ---------------------
-// Repository Preparation: Clone or Pull as needed and checkout PR branch
+// Repository Preparation: Clone or Pull as needed and checkout a given branch
 // ---------------------
-async function prepareRepository(repoName, cloneUrl, prBranchName) {
+async function prepareRepository(repoName, cloneUrl, branchName) {
   const currentDirName = path.basename(process.cwd());
   if (currentDirName !== repoName) {
     if (!fs.existsSync(repoName)) {
@@ -262,16 +262,16 @@ async function prepareRepository(repoName, cloneUrl, prBranchName) {
     process.exit(1);
   }
 
-  if (currentBranch === prBranchName) {
-    console.log(`Already on PR branch "${prBranchName}", pulling latest changes...`);
-    await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for PR branch ${prBranchName}` });
+  if (currentBranch === branchName) {
+    console.log(`Already on branch "${branchName}", pulling latest changes...`);
+    await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for branch ${branchName}` });
   } else {
-    console.log(`Checking out PR branch "${prBranchName}"...`);
-    await runCommand(`git checkout -B ${prBranchName} origin/${prBranchName}`, { dangerous: true, description: `Checking out PR branch ${prBranchName}` });
-    console.log(`Pulling latest changes for PR branch "${prBranchName}"...`);
-    await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for PR branch ${prBranchName}` });
+    console.log(`Checking out branch "${branchName}"...`);
+    await runCommand(`git checkout -B ${branchName} origin/${branchName}`, { dangerous: true, description: `Checking out branch ${branchName}` });
+    console.log(`Pulling latest changes for branch "${branchName}"...`);
+    await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for branch ${branchName}` });
   }
-  debug(`Repository '${repoName}' prepared on branch '${prBranchName}'. Current directory: ${process.cwd()}`);
+  debug(`Repository '${repoName}' prepared on branch '${branchName}'. Current directory: ${process.cwd()}`);
 }
 
 // ---------------------
@@ -351,13 +351,19 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     }
     const prDetails = await prResponse.json();
 
-    // Check if the pull request is already merged.
+    // If the pull request is already merged, ensure repository is cloned,
+    // check out the default branch, pull latest changes, and offer to push the new tag.
     if (prDetails.merged) {
       console.log("Pull request is already merged.");
-      const pushTag = await confirmAction(
-        "Do you want to push the new tag to the default branch?",
-        "git push origin v<new-tag>"
-      );
+      await prepareRepository(repo, repoDetails.clone_url, defaultBranch);
+      let currentBranch = execSync("git rev-parse --abbrev-ref HEAD", { encoding: "utf8" }).trim();
+      if (currentBranch !== defaultBranch) {
+        console.log(`Not on default branch. Checking out default branch "${defaultBranch}"...`);
+        await runCommand(`git checkout ${defaultBranch}`, { dangerous: true, description: `Checking out default branch ${defaultBranch}` });
+      }
+      console.log(`Pulling latest changes for default branch "${defaultBranch}"...`);
+      await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for default branch ${defaultBranch}` });
+      const pushTag = await confirmAction("Do you want to push the new tag to the default branch?", "git push origin v<new-tag>");
       if (pushTag) {
         await pushNewTag();
       } else {
