@@ -6,7 +6,7 @@
 //  • Use the GitHub API (with built‑in global fetch) to fetch PR details and commit statuses
 //  • Get the pull request’s branch (which may be any name provided by the developer)
 //  • Compare package.json versions on the default branch versus the PR branch
-//  • If the PR branch version is lower or equal to the default branch version:
+//  • If the PR branch version is lower or equal to the default branch version and the PR is not already merged:
 //      - Merge in the default branch,
 //      - Run yarn install (only if the merge actually brought in new changes),
 //      - And finally perform a yarn version bump (with patch/minor/major as specified)
@@ -14,7 +14,7 @@
 //  • Periodically (every 1 minute) the script will sync the PR branch with the default branch.
 //  • Finally, if all conditions pass, the script issues a GitHub API merge call (and prints out a cURL command)
 //    to merge the pull request.
-//  • Optionally, after bumping version, the script will prompt you to push the new tag.
+//  • Optionally, after version bumping (or if the PR was already merged), the script will prompt you to push the new tag.
 
 import path from "path";
 import fs from "fs";
@@ -350,6 +350,22 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       throw new Error(`Failed to fetch pull request details: ${prResponse.statusText}`);
     }
     const prDetails = await prResponse.json();
+
+    // Check if the pull request is already merged.
+    if (prDetails.merged) {
+      console.log("Pull request is already merged.");
+      const pushTag = await confirmAction(
+        "Do you want to push the new tag to the default branch?",
+        "git push origin v<new-tag>"
+      );
+      if (pushTag) {
+        await pushNewTag();
+      } else {
+        console.log("Skipping tag push.");
+      }
+      process.exit(0);
+    }
+
     const prBranchName = prDetails.head.ref;
     console.log(`Pull request branch: ${prBranchName}`);
 
@@ -375,7 +391,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       console.log(`Bumping version using "${bumpType}"...`);
       await bumpLocalVersionSafe(bumpType);
       await pushCurrentBranch(prBranchName);
-      // New optional step: Push the new tag if desired.
+      // Optional step: Push the new tag if desired.
       const pushTag = await confirmAction("Do you want to push the new tag?", "git push origin v<new-tag>");
       if (pushTag) {
         await pushNewTag();
