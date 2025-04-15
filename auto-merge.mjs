@@ -13,8 +13,9 @@
 //  • Every dangerous action (file system writes, git changes or API calls) asks for interactive confirmation.
 //  • Periodically (every 1 minute) the script will sync the PR branch with the default branch.
 //  • Before merging via GitHub API, the script polls GitHub to verify that all required checks/workflows are passing.
-//      - If a workflow is failing, it downloads its logs and re-runs it.
+//      - If a workflow or check run is failing, it downloads its logs and re-runs it.
 //      - After 2 failed re-run attempts, the script aborts and displays the collected logs.
+//  • Extensive debugging output has been added at each API call and decision point.
 //  • Finally, if all conditions pass and the PR is marked as mergeable, the script issues the GitHub API merge call.
 //  • Optionally, after a successful merge, the script prompts to push a new tag.
 
@@ -34,17 +35,16 @@ function debug(msg) {
 // Dynamic Imports via use-m for non built-in modules
 // ---------------------
 debug("Importing use-m to enable dynamic module loading...");
-const { use } = eval(
-  await fetch('https://unpkg.com/use-m/use.js').then(u => u.text())
-);
+const { use } = eval(await fetch("https://unpkg.com/use-m/use.js").then(u => u.text()));
 
-// Dynamically import dotenv to load environment variables.
+// Dynamically import dotenv, semver, and adm-zip modules.
 debug("Importing dotenv module...");
 const dotenv = await use("dotenv");
 debug("Importing semver module...");
 const semver = await use("semver");
 debug("Importing adm-zip module...");
 const AdmZip = await use("adm-zip");
+
 dotenv.config();
 debug("Environment variables loaded.");
 
@@ -87,8 +87,8 @@ debug(`Parsed PR URL: owner=${owner}, repo=${repo}, pullNumber=${pullNumber}`);
 
 // Common GitHub API headers.
 const headers = {
-  "Authorization": `token ${token}`,
-  "Accept": "application/vnd.github.v3+json",
+  Authorization: `token ${token}`,
+  Accept: "application/vnd.github.v3+json",
   "Content-Type": "application/json",
 };
 
@@ -100,10 +100,7 @@ async function confirmAction(description, commandText) {
   console.log(`ACTION: ${description}`);
   console.log(`REPRODUCIBLE COMMAND/API CALL:\n${commandText}`);
   console.log("================================================================================");
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const answer = await new Promise((resolve) => {
     rl.question("Do you want to continue? (y/n): ", resolve);
   });
@@ -113,7 +110,7 @@ async function confirmAction(description, commandText) {
 }
 
 // ---------------------
-// Utility: runCommand – async version with confirmation for dangerous operations.
+// Utility: runCommand – Execute shell commands with optional confirmation.
 // ---------------------
 async function runCommand(cmd, options = { dangerous: false, description: "" }) {
   debug(`Preparing to run command: ${cmd}`);
@@ -137,7 +134,6 @@ async function runCommand(cmd, options = { dangerous: false, description: "" }) 
 // Helper Functions for Repository and Version Bump
 // ---------------------
 
-// Fetch package.json from a given branch (via "git show").
 async function getPackageJsonFromBranch(branch) {
   debug(`Fetching package.json from branch: ${branch}`);
   const content = await runCommand(`git show origin/${branch}:package.json`);
@@ -145,7 +141,6 @@ async function getPackageJsonFromBranch(branch) {
   return JSON.parse(content);
 }
 
-// Read local package.json.
 function getLocalPackageJson() {
   debug("Reading local package.json file...");
   const content = fs.readFileSync("package.json", "utf8");
@@ -153,7 +148,6 @@ function getLocalPackageJson() {
   return JSON.parse(content);
 }
 
-// bumpLocalVersionSafe: bumps the version using Yarn's built-in version bump flags.
 async function bumpLocalVersionSafe(bumpType) {
   const cmd = `yarn version --${bumpType}`;
   console.log(`Bumping version using "${cmd}"...`);
@@ -161,7 +155,6 @@ async function bumpLocalVersionSafe(bumpType) {
   console.log("Version bump performed.");
 }
 
-// Pushes the current branch to origin.
 async function pushCurrentBranch(branchName) {
   const cmd = `git push origin ${branchName}`;
   const description = `This will push the branch "${branchName}" to origin.`;
@@ -169,7 +162,6 @@ async function pushCurrentBranch(branchName) {
   await runCommand(cmd, { dangerous: true, description });
 }
 
-// Pushes the new tag to origin.
 async function pushNewTag() {
   const localPkg = getLocalPackageJson();
   const tagName = `v${localPkg.version}`;
@@ -180,9 +172,6 @@ async function pushNewTag() {
   console.log(`Tag ${tagName} pushed successfully.`);
 }
 
-// Merges the default branch into the current branch.
-// If only package.json is in conflict, auto-resolves that conflict.
-// Returns the merge command output.
 async function mergeDefaultBranch(defaultBranch) {
   const mergeCmd = `git merge origin/${defaultBranch} --no-edit`;
   const description = `This will merge origin/${defaultBranch} into the current branch.`;
@@ -193,7 +182,7 @@ async function mergeDefaultBranch(defaultBranch) {
     return mergeOutput;
   } catch (e) {
     debug("Merge command failed, checking for conflicts...");
-    let conflictsOutput = await runCommand(`git diff --name-only --diff-filter=U`, { dangerous: false, description: "Checking merge conflicts" });
+    const conflictsOutput = await runCommand(`git diff --name-only --diff-filter=U`, { dangerous: false, description: "Checking merge conflicts" });
     const conflicts = conflictsOutput.split(/\n/).map(s => s.trim()).filter(Boolean);
     debug(`Detected conflicts in files: ${conflicts.join(", ")}`);
     if (conflicts.length === 1 && conflicts[0] === "package.json") {
@@ -217,44 +206,54 @@ async function mergeDefaultBranch(defaultBranch) {
   }
 }
 
-// Runs 'yarn install' to update yarn.lock and node_modules.
 async function updateDependencies() {
   const cmd = "yarn install";
-  const description = `This will update your local yarn.lock and node_modules.`;
+  const description = "This will update your local yarn.lock and node_modules.";
   debug("Running yarn install to update dependencies.");
   await runCommand(cmd, { dangerous: true, description });
   console.log("Local dependencies updated via yarn.");
 }
 
-// Helper to pause execution.
 function sleep(ms) {
   debug(`Sleeping for ${ms} ms...`);
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // ---------------------
-// Helpers for Handling Failed Workflow Runs
+// Helpers for Handling Failed Workflow/Check Runs with Extensive Tracing
 // ---------------------
-
-// getFailedWorkflowsForCommit: Retrieves failed workflow runs for a given commit SHA.
 async function getFailedWorkflowsForCommit(owner, repo, commitSHA, headers) {
   const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs?per_page=50`;
+  debug(`GET ${url}`);
   const resp = await fetch(url, { headers });
-  if (!resp.ok) {
-    throw new Error(`Failed to list workflow runs: ${resp.status} / ${resp.statusText}`);
-  }
   const data = await resp.json();
+  console.log("ALL WORKFLOW RUNS RESPONSE:", JSON.stringify(data, null, 2));
   const runsOnCommit = data.workflow_runs.filter(run => run.head_sha === commitSHA);
-  const failedRuns = runsOnCommit.filter(run => 
-    run.status === "completed" &&
-    (run.conclusion === "failure" || run.conclusion === "timed_out" || run.conclusion === "cancelled")
+  console.log(`Workflow runs for commit ${commitSHA}:`, JSON.stringify(runsOnCommit, null, 2));
+  const failedRuns = runsOnCommit.filter(
+    run => run.status === "completed" &&
+           (run.conclusion === "failure" || run.conclusion === "timed_out" || run.conclusion === "cancelled")
   );
+  console.log(`Failed workflow runs for commit ${commitSHA}:`, JSON.stringify(failedRuns, null, 2));
   return failedRuns;
 }
 
-// downloadWorkflowLogs: Downloads logs (.zip) for a given run_id and extracts them.
+async function getFailedCheckRunsForCommit(owner, repo, commitSHA, headers) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/commits/${commitSHA}/check-runs`;
+  debug(`GET ${url}`);
+  const resp = await fetch(url, { headers });
+  const data = await resp.json();
+  console.log("ALL CHECK RUNS RESPONSE:", JSON.stringify(data, null, 2));
+  const failedCheckRuns = data.check_runs.filter(
+    run => run.conclusion === "failure" || run.conclusion === "timed_out" || run.conclusion === "cancelled"
+  );
+  console.log(`Failed check runs for commit ${commitSHA}:`, JSON.stringify(failedCheckRuns, null, 2));
+  return failedCheckRuns;
+}
+
 async function downloadWorkflowLogs(owner, repo, runId, headers) {
   const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/logs`;
+  debug(`Downloading logs from ${url}`);
   const resp = await fetch(url, { headers });
   if (!resp.ok) {
     throw new Error(`Failed to download logs for run ${runId}: ${resp.status} / ${resp.statusText}`);
@@ -266,20 +265,19 @@ async function downloadWorkflowLogs(owner, repo, runId, headers) {
   }
   const zipPath = path.join("logs", `run-${runId}.zip`);
   fs.writeFileSync(zipPath, buffer);
+  debug(`Logs saved to ${zipPath}`);
   const zip = new AdmZip(zipPath);
   const extractDir = path.join("logs", `run-${runId}`);
   zip.extractAllTo(extractDir, true);
-  console.log(`Logs for run ${runId} saved in ${extractDir}`);
+  console.log(`Logs for run ${runId} extracted to ${extractDir}`);
   return { zipPath, extractDir };
 }
 
-// reRunWorkflow: Attempts to re-run a given workflow run.
 async function reRunWorkflow(owner, repo, runId, headers) {
   const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/rerun`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers,
-  });
+  debug(`POST ${url}`);
+  const resp = await fetch(url, { method: "POST", headers });
+  debug(`Re-run response status: ${resp.status}`);
   if (resp.status === 403) {
     throw new Error(`Forbidden: Could not re-run workflow ${runId}.`);
   }
@@ -289,111 +287,144 @@ async function reRunWorkflow(owner, repo, runId, headers) {
   console.log(`Requested re-run for workflow run ${runId}.`);
 }
 
-// handleFailedWorkflows: If failed workflows are detected, downloads logs, re-runs them,
-// and retries (up to maxRetries) until they pass or abort.
+async function reRunCheckSuite(owner, repo, checkSuiteId, headers) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/check-suites/${checkSuiteId}/rerequest`;
+  debug(`POST re-run check suite ${url}`);
+  const resp = await fetch(url, { method: "POST", headers });
+  if (resp.status === 403) {
+    throw new Error(`Forbidden: Could not re-run check suite ${checkSuiteId}.`);
+  }
+  if (!resp.ok) {
+    throw new Error(`Failed to re-run check suite ${checkSuiteId}: ${resp.status} / ${resp.statusText}`);
+  }
+  console.log(`Requested re-run for check suite ${checkSuiteId}.`);
+}
+
 async function handleFailedWorkflows(owner, repo, commitSHA, headers, maxRetries = 2) {
   let attempt = 0;
   while (attempt <= maxRetries) {
-    const failedRuns = await getFailedWorkflowsForCommit(owner, repo, commitSHA, headers);
-    if (failedRuns.length === 0) {
+    console.log(`Checking for failed workflows and check runs (attempt ${attempt} of ${maxRetries}) for commit ${commitSHA}...`);
+    const failedWorkflowRuns = await getFailedWorkflowsForCommit(owner, repo, commitSHA, headers);
+    const failedCheckRuns = await getFailedCheckRunsForCommit(owner, repo, commitSHA, headers);
+    
+    // Check for pending check runs as well
+    const checkRunsResp = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${commitSHA}/check-runs`, { headers });
+    const checkRunsData = await checkRunsResp.json();
+    const pendingCheckRuns = checkRunsData.check_runs.filter(run => run.status !== "completed");
+    if (failedWorkflowRuns.length === 0 && failedCheckRuns.length === 0 && pendingCheckRuns.length === 0) {
+      console.log("No failed or pending workflow/check runs detected.");
       return true;
     }
-    console.log(`Found ${failedRuns.length} failed run(s). Attempt ${attempt} of ${maxRetries}.`);
-    for (const run of failedRuns) {
-      console.log(`Downloading logs for failed run #${run.id} (${run.name}).`);
+    if (pendingCheckRuns.length > 0) {
+      console.log(`There are ${pendingCheckRuns.length} pending check run(s). Waiting for them to finish...`);
+      await sleep(30000);
+      attempt++;
+      continue;
+    }
+    console.log(`Found ${failedWorkflowRuns.length} failed workflow run(s) and ${failedCheckRuns.length} failed check run(s).`);
+    for (const run of failedWorkflowRuns) {
+      console.log(`Downloading logs for failed workflow run #${run.id} (${run.name}).`);
       try {
         await downloadWorkflowLogs(owner, repo, run.id, headers);
       } catch (err) {
-        console.error(`Error downloading logs for run #${run.id}: ${err.message}`);
+        console.error(`Error downloading logs for workflow run #${run.id}: ${err.message}`);
       }
     }
-    if (attempt === maxRetries) {
-      console.error("Max retries reached. Aborting workflow re-run attempts. See logs in the 'logs' folder.");
-      return false;
+    // For check runs: extract unique check_suite ids and re-run them.
+    const failedCheckSuites = new Set();
+    for (const check of failedCheckRuns) {
+      if (check.check_suite && check.check_suite.id) {
+        failedCheckSuites.add(check.check_suite.id);
+      }
     }
-    for (const run of failedRuns) {
+    for (const suiteId of failedCheckSuites) {
+      try {
+        await reRunCheckSuite(owner, repo, suiteId, headers);
+      } catch (err) {
+        console.error(`Error re-running check suite ${suiteId}: ${err.message}`);
+      }
+    }
+    // Re-run individual workflow runs as well.
+    for (const run of failedWorkflowRuns) {
       try {
         await reRunWorkflow(owner, repo, run.id, headers);
       } catch (err) {
-        console.error(`Error re-running workflow #${run.id}: ${err.message}`);
+        console.error(`Error re-running workflow run #${run.id}: ${err.message}`);
       }
     }
-    console.log("Waiting 30s for re-run to start...");
+    console.log("Waiting 30s for re-run workflows and check suites to start...");
     await sleep(30000);
     attempt++;
   }
+  console.error("Max retries reached. Aborting workflow/check re-run attempts. See logs in the 'logs' folder.");
   return false;
 }
 
 // ---------------------
-// Extended Wait for Mergeable with Workflow Re-run
+// Extended Wait for Mergeable with Workflow/Check Re-run and Extensive Tracing
 // ---------------------
 async function waitForPRToBeMergeableWithRetries(owner, repo, pullNum, headers) {
   const maxPollingRounds = 30;
   let pollCount = 0;
   while (pollCount < maxPollingRounds) {
-    console.log("Checking if PR is mergeable (waiting for checks/reviews)...");
+    console.log("Polling PR for mergeability...");
     const prRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${pullNum}`, { headers });
-    if (!prRes.ok) {
-      throw new Error(`Failed to fetch PR details: ${prRes.statusText}`);
-    }
     const pr = await prRes.json();
+    console.log("Current PR JSON:", JSON.stringify(pr, null, 2));
     if (pr.merged) {
       console.log("Pull request is already merged externally.");
       return false;
     }
     if (!pr.mergeable) {
-      console.log(`mergeable=${pr.mergeable}, mergeable_state=${pr.mergeable_state}. Possibly waiting on checks or reviews.`);
+      console.log(`PR mergeable=${pr.mergeable}, mergeable_state=${pr.mergeable_state}.`);
       if (pr.mergeable_state === "blocked" || pr.mergeable_state === "unstable") {
-        console.log(`mergeable_state=${pr.mergeable_state} => Attempting to handle failed workflows...`);
+        console.log(`Detected mergeable_state=${pr.mergeable_state}. Attempting to handle failed workflows/checks...`);
         const commitSHA = pr.head.sha;
         const success = await handleFailedWorkflows(owner, repo, commitSHA, headers, 2);
         if (!success) {
-          console.error("Failed workflows could not be fixed after 2 attempts. Aborting.");
+          console.error("Failed workflows/checks could not be fixed after 2 attempts. Aborting.");
           return false;
         }
       }
+      console.log("Waiting 30s before next poll...");
       await sleep(30000);
       pollCount++;
       continue;
     }
     switch (pr.mergeable_state) {
       case "clean":
-        console.log("PR is mergeable and 'clean'. All checks have passed. Proceeding...");
+        console.log("PR is mergeable and 'clean'. All checks passed. Proceeding to merge.");
         return true;
       case "blocked":
       case "behind":
       case "unstable":
       case "has_hooks":
-        console.log(`mergeable_state=${pr.mergeable_state}. Will wait and retry in 30s...`);
+        console.log(`PR mergeable_state=${pr.mergeable_state}. Retrying in 30s...`);
         await sleep(30000);
         break;
       case "draft":
       case "dirty":
       case "unknown":
       default:
-        console.log(`mergeable_state=${pr.mergeable_state}. Possibly a draft or conflict. Retrying in 30s...`);
+        console.log(`PR mergeable_state=${pr.mergeable_state}. Possibly a draft or conflict. Retrying in 30s...`);
         await sleep(30000);
         break;
     }
     pollCount++;
   }
-  console.error("Exceeded max polling rounds waiting for PR to become mergeable. Aborting.");
+  console.error("Exceeded maximum polling rounds for mergeability. Aborting.");
   return false;
 }
 
 // ---------------------
-// Repository Preparation: Clone or Pull as needed and checkout a given branch
+// Repository Preparation: Clone or Pull and Checkout Branch
 // ---------------------
 async function prepareRepository(repoName, cloneUrl, branchName) {
   const currentDirName = path.basename(process.cwd());
   if (currentDirName !== repoName) {
     if (!fs.existsSync(repoName)) {
       console.log(`Directory '${repoName}' not found.`);
-      const confirmed = await confirmAction(
-        `Cloning repository ${repoName} from ${cloneUrl}`,
-        `git clone ${cloneUrl} ${repoName}`
-      );
+      const confirmed = await confirmAction(`Cloning repository ${repoName} from ${cloneUrl}`, `git clone ${cloneUrl} ${repoName}`);
       if (!confirmed) {
         console.error("Clone aborted by user.");
         process.exit(1);
@@ -426,33 +457,29 @@ async function prepareRepository(repoName, cloneUrl, branchName) {
 }
 
 // ---------------------
-// Merges the pull request via GitHub API.
+// Merges the PR via GitHub API.
+// ---------------------
 async function mergePullRequest() {
-  const mergeData = {
-    commit_title: `Auto-merge pull request #${pullNumber}`,
-    merge_method: "merge",
-  };
+  const mergeData = { commit_title: `Auto-merge pull request #${pullNumber}`, merge_method: "merge" };
   const apiUrl = `https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}/merge`;
   const curlCommand = `curl -X PUT ${apiUrl} \\\n  -H "Authorization: token ${token}" \\\n  -H "Content-Type: application/json" \\\n  -d '${JSON.stringify(mergeData)}'`;
   if (!(await confirmAction("Merging the pull request via GitHub API", curlCommand))) {
     throw new Error("User aborted GitHub API merge call.");
   }
-  debug(`Sending merge request to GitHub API at ${apiUrl}...`);
-  const response = await fetch(apiUrl, {
-    method: "PUT",
-    headers,
-    body: JSON.stringify(mergeData),
-  });
+  debug(`Sending merge request to ${apiUrl} with data: ${JSON.stringify(mergeData)}`);
+  const response = await fetch(apiUrl, { method: "PUT", headers, body: JSON.stringify(mergeData) });
   if (!response.ok) {
     const errorData = await response.json();
     throw new Error(`Merge failed: ${errorData.message}`);
   }
-  debug("GitHub API merge successful.");
-  return response.json();
+  const mergeResult = await response.json();
+  debug("Merge API response: " + JSON.stringify(mergeResult, null, 2));
+  return mergeResult;
 }
 
 // ---------------------
-// Periodically syncs the PR branch with the default branch, merging and updating dependencies.
+// Periodically syncs the PR branch with the default branch.
+// ---------------------
 async function syncBranchWithDefault(defaultBranch, prBranchName) {
   while (true) {
     console.log("\n--- Fetching latest changes from origin ---");
@@ -460,14 +487,14 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       await runCommand(`git fetch origin ${defaultBranch}`, { dangerous: false, description: "Fetching updates from the default branch" });
       debug(`Fetched latest changes for branch: ${defaultBranch}`);
     } catch (e) {
-      console.error("Failed to fetch the default branch:", e.message);
+      console.error("Failed to fetch updates:", e.message);
     }
     const mergeOutput = await mergeDefaultBranch(defaultBranch);
     if (!mergeOutput.includes("Already up to date")) {
-      console.log("New changes merged from default branch, updating dependencies via yarn install...");
+      console.log("New changes merged from default branch. Updating dependencies...");
       await updateDependencies();
       await pushCurrentBranch(prBranchName);
-      console.log("Dependencies updated. Checking merge status in 1 minute...");
+      console.log("Dependencies updated. Waiting 60s before next sync...");
       await sleep(60000);
     } else {
       console.log("PR branch is up-to-date with the default branch. Skipping yarn install.");
@@ -489,7 +516,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     }
     const repoDetails = await repoResponse.json();
     const defaultBranch = repoDetails.default_branch;
-    console.log(`Default branch is: ${defaultBranch}`);
+    console.log(`Default branch: ${defaultBranch}`);
     debug(`Repository details: ${JSON.stringify(repoDetails)}`);
 
     console.log("Fetching pull request details...");
@@ -498,18 +525,18 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       throw new Error(`Failed to fetch pull request details: ${prResponse.statusText}`);
     }
     const prDetails = await prResponse.json();
+    console.log("Pull request details:", JSON.stringify(prDetails, null, 2));
 
-    // If the pull request is already merged, checkout default branch and optionally push tag.
     if (prDetails.merged) {
-      console.log("Pull request is already merged.");
+      console.log("PR already merged. Preparing default branch...");
       await prepareRepository(repo, repoDetails.clone_url, defaultBranch);
       let currentBranch = execSync("git rev-parse --abbrev-ref HEAD", { encoding: "utf8" }).trim();
       if (currentBranch !== defaultBranch) {
-        console.log(`Not on default branch. Checking out default branch "${defaultBranch}"...`);
+        console.log(`Not on default branch. Checking out "${defaultBranch}"...`);
         await runCommand(`git checkout ${defaultBranch}`, { dangerous: true, description: `Checking out default branch ${defaultBranch}` });
       }
-      console.log(`Pulling latest changes for default branch "${defaultBranch}"...`);
-      await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for default branch ${defaultBranch}` });
+      console.log(`Pulling latest changes for "${defaultBranch}"...`);
+      await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for branch ${defaultBranch}` });
       const pushTag = await confirmAction("Do you want to push the new tag to the default branch?", "git push origin v<new-tag>");
       if (pushTag) {
         await pushNewTag();
@@ -520,44 +547,43 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     }
 
     const prBranchName = prDetails.head.ref;
-    console.log(`Pull request branch: ${prBranchName}`);
+    console.log(`PR branch: ${prBranchName}`);
     await prepareRepository(repo, repoDetails.clone_url, prBranchName);
 
-    console.log("\nComparing package.json versions between default branch and PR branch...");
+    console.log("\nComparing package.json versions...");
     const defaultPkg = await getPackageJsonFromBranch(defaultBranch);
     const localPkg = getLocalPackageJson();
     console.log(`Default branch package.json version: ${defaultPkg.version}`);
     console.log(`PR branch package.json version: ${localPkg.version}`);
-    debug(`Default pkg version: ${defaultPkg.version}, PR branch pkg version: ${localPkg.version}`);
+    debug(`Default version: ${defaultPkg.version}, PR branch version: ${localPkg.version}`);
 
     if (semver.lte(localPkg.version, defaultPkg.version)) {
-      console.log("PR branch version is lower or equal to the default branch version.");
-      console.log("Merging default branch into PR branch...");
+      console.log("PR branch version is less than or equal to the default branch version. Merging default branch into PR branch...");
       const mergeOutput = await mergeDefaultBranch(defaultBranch);
       if (!mergeOutput.includes("Already up to date")) {
-        console.log("Merge brought in new changes, updating dependencies via yarn install...");
+        console.log("Merge brought changes. Updating dependencies...");
         await updateDependencies();
       } else {
-        console.log("No changes detected from merging default branch, skipping yarn install.");
+        console.log("No changes from merge. Skipping dependency update.");
       }
       console.log(`Bumping version using "${bumpType}"...`);
       await bumpLocalVersionSafe(bumpType);
       await pushCurrentBranch(prBranchName);
     } else {
-      console.log("PR branch version is greater than the default branch version. No version bump required.");
+      console.log("PR branch version is greater than default branch version. No version bump required.");
     }
 
     console.log("\nStarting periodic sync with default branch...");
     await syncBranchWithDefault(defaultBranch, prBranchName);
 
-    // Wait for the PR to be fully mergeable (including passing workflows)
+    console.log("\nWaiting for PR to become mergeable (including workflow/checks)...");
     const canMerge = await waitForPRToBeMergeableWithRetries(owner, repo, pullNumber, headers);
     if (!canMerge) {
-      console.log("Exiting without merge, because the PR was either merged externally or is unmergeable/failing.");
+      console.log("Exiting without merge since PR is either merged externally or unmergeable.");
       process.exit(0);
     }
 
-    console.log("\nAll updates and checks passed, and the PR is mergeable. Proceeding to merge via GitHub API...");
+    console.log("\nAll checks passed and PR is mergeable. Proceeding with merge via GitHub API...");
     const mergeResult = await mergePullRequest();
     if (mergeResult.merged) {
       console.log("Pull request merged successfully!");
@@ -570,7 +596,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       }
     } else {
       console.error("Merge failed:", mergeResult.message);
-      debug("Merge result: " + JSON.stringify(mergeResult));
+      debug("Merge response:", JSON.stringify(mergeResult, null, 2));
     }
   } catch (error) {
     console.error("Error:", error.message);
