@@ -17,8 +17,10 @@
 //      - After 2 failed re-run attempts, the script aborts and displays the collected logs.
 //  • Additionally, if the PR is not approved (i.e. it has not received at least the required approvals),
 //      the script fails and asks the user to get approval from someone on the team.
+//  • Finally, if a merge conflict is detected in package.json the script will only auto-resolve if the only change is in the version field;
+//      otherwise, it aborts and asks the user to resolve conflicts manually.
 //  • Extensive debugging output has been added at each API call and decision point.
-//  • Finally, if all conditions pass and the PR is marked as mergeable and approved, the script issues the GitHub API merge call.
+//  • If all conditions pass and the PR is mergeable and approved, the script issues the GitHub API merge call.
 //  • Optionally, after a successful merge, the script prompts to push a new tag.
 
 import path from "path";
@@ -131,6 +133,43 @@ async function runCommand(cmd, options = { dangerous: false, description: "" }) 
 }
 
 // ---------------------
+// Helper Function: Determine if package.json conflict is only in version field.
+// ---------------------
+function isOnlyVersionConflict(filePath) {
+  try {
+    const content = fs.readFileSync(filePath, "utf8");
+    // If no conflict markers found, it's not conflicted.
+    if (!content.includes("<<<<<<<") || !content.includes("=======") || !content.includes(">>>>>>>")) {
+      return true;
+    }
+    // Regular expression to capture a conflict block.
+    // This regex captures text between conflict markers.
+    const conflictBlockRegex = /<<<<<<< HEAD([\s\S]*?)=======([\s\S]*?)>>>>>>>/g;
+    let match;
+    while ((match = conflictBlockRegex.exec(content)) !== null) {
+      const blockHead = match[1].trim();
+      const blockOther = match[2].trim();
+      // Split the block lines
+      const headLines = blockHead.split("\n").map(line => line.trim()).filter(line => line.length > 0);
+      const otherLines = blockOther.split("\n").map(line => line.trim()).filter(line => line.length > 0);
+      // We expect exactly one line in each block if only the version field is conflicted.
+      if (headLines.length !== 1 || otherLines.length !== 1) {
+        return false;
+      }
+      // Use a regex to test if the line is for the version property.
+      const versionLineRegex = /^"version":\s*".+",?$/;
+      if (!versionLineRegex.test(headLines[0]) || !versionLineRegex.test(otherLines[0])) {
+        return false;
+      }
+    }
+    return true;
+  } catch (err) {
+    console.error("Error reading file for conflict check:", err.message);
+    return false;
+  }
+}
+
+// ---------------------
 // Helper Functions for Repository and Version Bump
 // ---------------------
 async function getPackageJsonFromBranch(branch) {
@@ -184,18 +223,25 @@ async function mergeDefaultBranch(defaultBranch) {
     const conflictsOutput = await runCommand(`git diff --name-only --diff-filter=U`, { dangerous: false, description: "Checking merge conflicts" });
     const conflicts = conflictsOutput.split(/\n/).map(s => s.trim()).filter(Boolean);
     debug(`Detected conflicts in files: ${conflicts.join(", ")}`);
+    // Only auto-resolve if the only conflict is package.json
     if (conflicts.length === 1 && conflicts[0] === "package.json") {
-      const resCmd = `git checkout --theirs package.json && git add package.json && git commit -m "Auto-resolved package.json conflict from merging origin/${defaultBranch}"`;
-      const confirmation = await confirmAction("Auto-resolving package.json conflict", resCmd);
-      if (!confirmation) {
-        console.error("Please resolve the conflicts manually and restart the script.");
+      // Check that the conflict in package.json is solely in the "version" field.
+      if (isOnlyVersionConflict("package.json")) {
+        const resCmd = `git checkout --theirs package.json && git add package.json && git commit -m "Auto-resolved package.json version conflict from merging origin/${defaultBranch}"`;
+        const confirmation = await confirmAction("Auto-resolving package.json conflict on the version field", resCmd);
+        if (!confirmation) {
+          console.error("Please resolve the conflicts manually and restart the script.");
+          process.exit(1);
+        }
+        await runCommand(`git checkout --theirs package.json`, { dangerous: true, description: "Auto-resolve package.json conflict" });
+        await runCommand(`git add package.json`, { dangerous: true, description: "Staging resolved package.json" });
+        await runCommand(`git commit -m "Auto-resolved package.json version conflict from merging origin/${defaultBranch}"`, { dangerous: true, description: "Committing the conflict resolution" });
+        debug("Auto-resolved package.json conflict on version field.");
+        return "Merge completed with auto-resolved package.json version conflict";
+      } else {
+        console.error("Conflict in package.json involves changes beyond the version field. Please resolve manually.");
         process.exit(1);
       }
-      await runCommand(`git checkout --theirs package.json`, { dangerous: true, description: "Auto-resolve package.json conflict" });
-      await runCommand(`git add package.json`, { dangerous: true, description: "Staging resolved package.json" });
-      await runCommand(`git commit -m "Auto-resolved package.json conflict from merging origin/${defaultBranch}"`, { dangerous: true, description: "Committing the conflict resolution" });
-      debug("Auto-resolved package.json conflict.");
-      return "Merge completed with auto-resolved conflicts";
     } else if (conflicts.length > 0) {
       console.error("Merge conflicts detected in files:", conflicts);
       console.error("Please resolve these conflicts manually and then restart the script.");
