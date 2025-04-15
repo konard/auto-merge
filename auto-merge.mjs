@@ -375,41 +375,35 @@ async function waitForPRToBeMergeableWithRetries(owner, repo, pullNum, headers) 
       console.log("Pull request is already merged externally.");
       return false;
     }
-    if (!pr.mergeable) {
-      console.log(`PR mergeable=${pr.mergeable}, mergeable_state=${pr.mergeable_state}.`);
-      if (pr.mergeable_state === "blocked" || pr.mergeable_state === "unstable") {
-        console.log(`Detected mergeable_state=${pr.mergeable_state}. Attempting to handle failed workflows/checks...`);
-        const commitSHA = pr.head.sha;
-        const success = await handleFailedWorkflows(owner, repo, commitSHA, headers, 2);
-        if (!success) {
-          console.error("Failed workflows/checks could not be fixed after 2 attempts. Aborting.");
-          return false;
-        }
+    // Check the mergeable_state regardless of pr.mergeable
+    if (pr.mergeable_state === "blocked" || pr.mergeable_state === "unstable") {
+      console.log(`Detected mergeable_state=${pr.mergeable_state}. Attempting to handle failed workflows/checks...`);
+      const commitSHA = pr.head.sha;
+      const success = await handleFailedWorkflows(owner, repo, commitSHA, headers, 2);
+      if (!success) {
+        console.error("Failed workflows/checks could not be fixed after 2 attempts. Aborting.");
+        return false;
       }
-      console.log("Waiting 30s before next poll...");
+      console.log("Workflows restarted. Re-polling soon...");
+      await sleep(5000); // short wait after handling failures
+      pollCount++;
+      continue;
+    }
+    // If the pr.mergeable property is false (or not available), wait a bit.
+    if (!pr.mergeable) {
+      console.log(`PR mergeable property is false, waiting 30s...`);
       await sleep(30000);
       pollCount++;
       continue;
     }
-    switch (pr.mergeable_state) {
-      case "clean":
-        console.log("PR is mergeable and 'clean'. All checks passed. Proceeding to merge.");
-        return true;
-      case "blocked":
-      case "behind":
-      case "unstable":
-      case "has_hooks":
-        console.log(`PR mergeable_state=${pr.mergeable_state}. Retrying in 30s...`);
-        await sleep(30000);
-        break;
-      case "draft":
-      case "dirty":
-      case "unknown":
-      default:
-        console.log(`PR mergeable_state=${pr.mergeable_state}. Possibly a draft or conflict. Retrying in 30s...`);
-        await sleep(30000);
-        break;
+    // If mergeable_state is "clean", proceed.
+    if (pr.mergeable_state === "clean") {
+      console.log("PR is mergeable and 'clean'. All checks passed. Proceeding to merge.");
+      return true;
     }
+    // For any other mergeable_state, wait the default period.
+    console.log(`PR mergeable_state=${pr.mergeable_state}. Retrying in 30s...`);
+    await sleep(30000);
     pollCount++;
   }
   console.error("Exceeded maximum polling rounds for mergeability. Aborting.");
