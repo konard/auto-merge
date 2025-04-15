@@ -14,6 +14,7 @@
 //  • Periodically (every 1 minute) the script will sync the PR branch with the default branch.
 //  • Finally, if all conditions pass, the script issues a GitHub API merge call (and prints out a cURL command)
 //    to merge the pull request.
+//  • Optionally, after bumping version, the script will prompt you to push the new tag.
 
 import path from "path";
 import fs from "fs";
@@ -162,6 +163,17 @@ async function pushCurrentBranch(branchName) {
   const description = `This will push the branch "${branchName}" to origin.`;
   debug(`Pushing current branch ${branchName} to origin.`);
   await runCommand(cmd, { dangerous: true, description });
+}
+
+// Pushes the new tag to origin.
+async function pushNewTag() {
+  const localPkg = getLocalPackageJson();
+  const tagName = `v${localPkg.version}`;
+  const cmd = `git push origin ${tagName}`;
+  const description = `This will push the new tag ${tagName} to origin.`;
+  debug(`Pushing new tag ${tagName} to origin.`);
+  await runCommand(cmd, { dangerous: true, description });
+  console.log(`Tag ${tagName} pushed successfully.`);
 }
 
 // Merges the default branch into the current branch.
@@ -363,6 +375,13 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       console.log(`Bumping version using "${bumpType}"...`);
       await bumpLocalVersionSafe(bumpType);
       await pushCurrentBranch(prBranchName);
+      // New optional step: Push the new tag if desired.
+      const pushTag = await confirmAction("Do you want to push the new tag?", "git push origin v<new-tag>");
+      if (pushTag) {
+        await pushNewTag();
+      } else {
+        console.log("Skipping tag push.");
+      }
     } else {
       console.log("PR branch version is greater than the default branch version. No version bump required.");
     }
