@@ -14,7 +14,8 @@
 //  • Periodically (every 1 minute) the script will sync the PR branch with the default branch.
 //  • Finally, if all conditions pass, the script issues a GitHub API merge call (and prints out a cURL command)
 //    to merge the pull request.
-//  • Optionally, if the PR is already merged or after a version bump, the script will prompt you to push the new tag to the default branch.
+//  • Optionally, if the PR is already merged or after a version bump and a successful merge,
+//    the script will prompt you to push the new tag to the default branch.
 
 import path from "path";
 import fs from "fs";
@@ -397,13 +398,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       console.log(`Bumping version using "${bumpType}"...`);
       await bumpLocalVersionSafe(bumpType);
       await pushCurrentBranch(prBranchName);
-      // Optional step: Push the new tag if desired.
-      const pushTag = await confirmAction("Do you want to push the new tag?", "git push origin v<new-tag>");
-      if (pushTag) {
-        await pushNewTag();
-      } else {
-        console.log("Skipping tag push.");
-      }
+      // Removed tag push here -- it will be prompted after a successful merge.
     } else {
       console.log("PR branch version is greater than the default branch version. No version bump required.");
     }
@@ -416,6 +411,13 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     if (mergeResult.merged) {
       console.log("Pull request merged successfully!");
       debug("Merge result: " + JSON.stringify(mergeResult));
+      // Now that the PR is merged, ask about pushing the tag.
+      const pushTag = await confirmAction("Do you want to push the new tag to the default branch?", "git push origin v<new-tag>");
+      if (pushTag) {
+        await pushNewTag();
+      } else {
+        console.log("Skipping tag push.");
+      }
     } else {
       console.error("Merge failed:", mergeResult.message);
       debug("Merge result: " + JSON.stringify(mergeResult));
