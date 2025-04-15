@@ -153,28 +153,13 @@ function getLocalPackageJson() {
   return JSON.parse(content);
 }
 
-// bumpLocalVersionSafe: safely bumps the version using semver and yarn version.
-// It computes a version strictly greater than defaultVersion and ensures the tag does not already exist.
-async function bumpLocalVersionSafe(bumpType, localVersion, defaultVersion) {
-  let newVersion = semver.inc(localVersion, bumpType);
-  // Ensure the new version is > defaultVersion
-  while (!semver.gt(newVersion, defaultVersion)) {
-    newVersion = semver.inc(newVersion, bumpType);
-  }
-  // Ensure the tag "v<newVersion>" does not already exist.
-  let tag = `v${newVersion}`;
-  let tags = await runCommand('git tag', { dangerous: false, description: "Listing existing git tags" });
-  tags = tags.split("\n").map(t => t.trim());
-  while (tags.includes(tag)) {
-    console.log(`Tag ${tag} already exists. Bumping version further...`);
-    newVersion = semver.inc(newVersion, bumpType);
-    tag = `v${newVersion}`;
-  }
-  console.log(`Bumping version from ${localVersion} to ${newVersion}`);
-  const cmd = `yarn version --new-version ${newVersion}`;
-  await runCommand(cmd, { dangerous: true, description: `This will bump the version to ${newVersion} using yarn version` });
+// bumpLocalVersionSafe: now safely bumps the version using Yarn's built-in version bump flags.
+async function bumpLocalVersionSafe(bumpType) {
+  // Using allowed bump types: patch, minor, or major.
+  const cmd = `yarn version --${bumpType}`;
+  console.log(`Bumping version using "${cmd}"...`);
+  await runCommand(cmd, { dangerous: true, description: `This will bump the version using yarn version --${bumpType}` });
   console.log("Version bump performed.");
-  return newVersion;
 }
 
 // Pushes the current branch to origin.
@@ -391,7 +376,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       console.log("Running yarn install to update dependencies...");
       await updateDependencies();
       console.log(`Bumping version using "${bumpType}"...`);
-      await bumpLocalVersionSafe(bumpType, localPkg.version, defaultPkg.version);
+      await bumpLocalVersionSafe(bumpType);
       await pushCurrentBranch(prBranchName);
     } else {
       console.log("PR branch version is greater than the default branch version. No version bump required.");
