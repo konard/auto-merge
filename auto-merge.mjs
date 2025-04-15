@@ -15,7 +15,7 @@
 //  • Before merging via GitHub API, the script polls GitHub to verify that all required checks/workflows are passing.
 //      - If a workflow or check run is failing, it downloads its logs and re-runs it.
 //      - After 2 failed re-run attempts, the script aborts and displays the collected logs.
-//  • Additionally, if the PR is not approved (i.e. review_decision is "REVIEW_REQUIRED" or "CHANGES_REQUESTED"), 
+//  • Additionally, if the PR is not approved (i.e. it has not received at least the required approvals),
 //      the script fails and asks the user to get approval from someone on the team.
 //  • Extensive debugging output has been added at each API call and decision point.
 //  • Finally, if all conditions pass and the PR is marked as mergeable and approved, the script issues the GitHub API merge call.
@@ -39,7 +39,6 @@ function debug(msg) {
 debug("Importing use-m to enable dynamic module loading...");
 const { use } = eval(await fetch("https://unpkg.com/use-m/use.js").then(u => u.text()));
 
-// Dynamically import dotenv, semver, and adm-zip modules.
 debug("Importing dotenv module...");
 const dotenv = await use("dotenv");
 debug("Importing semver module...");
@@ -76,8 +75,6 @@ if (!["patch", "minor", "major"].includes(bumpType)) {
   process.exit(1);
 }
 
-// Extract owner, repo, and pull request number from the URL.
-// Expected format: https://github.com/<owner>/<repo>/pull/<number>
 const prRegex = /^https:\/\/github\.com\/([^\/]+)\/([^\/]+)\/pull\/(\d+)/;
 const match = prUrl.match(prRegex);
 if (!match) {
@@ -87,7 +84,6 @@ if (!match) {
 const [ , owner, repo, pullNumber ] = match;
 debug(`Parsed PR URL: owner=${owner}, repo=${repo}, pullNumber=${pullNumber}`);
 
-// Common GitHub API headers.
 const headers = {
   Authorization: `token ${token}`,
   Accept: "application/vnd.github.v3+json",
@@ -135,7 +131,6 @@ async function runCommand(cmd, options = { dangerous: false, description: "" }) 
 // ---------------------
 // Helper Functions for Repository and Version Bump
 // ---------------------
-
 async function getPackageJsonFromBranch(branch) {
   debug(`Fetching package.json from branch: ${branch}`);
   const content = await runCommand(`git show origin/${branch}:package.json`);
@@ -219,6 +214,40 @@ async function updateDependencies() {
 function sleep(ms) {
   debug(`Sleeping for ${ms} ms...`);
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ---------------------
+// New Helper: Check if PR is Approved
+// ---------------------
+// This function fetches the list of reviews for a PR,
+// aggregates them by reviewer (only keeping the latest review per user),
+// and returns true if at least one (or the required number of) approval(s) is present.
+async function isPRApproved(owner, repo, pullNumber, headers) {
+  const reviewsUrl = `https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}/reviews`;
+  console.log(`Fetching reviews from: ${reviewsUrl}`);
+  const response = await fetch(reviewsUrl, { headers });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch reviews: ${response.status} ${response.statusText}`);
+  }
+  const reviews = await response.json();
+  const reviewMap = new Map();
+  reviews.forEach(review => {
+    // Ensure the review has a submission date
+    if (!review.submitted_at) return;
+    const username = review.user.login;
+    if (!reviewMap.has(username) || new Date(review.submitted_at) > new Date(reviewMap.get(username).submitted_at)) {
+      reviewMap.set(username, review);
+    }
+  });
+  let approvedCount = 0;
+  reviewMap.forEach(review => {
+    if (review.state.toUpperCase() === "APPROVED") {
+      approvedCount++;
+    }
+  });
+  console.log(`Approved reviews count: ${approvedCount}`);
+  const REQUIRED_APPROVALS = 1; // Change this value if your repo requires more approvals
+  return approvedCount >= REQUIRED_APPROVALS;
 }
 
 // ---------------------
@@ -309,7 +338,6 @@ async function handleFailedWorkflows(owner, repo, commitSHA, headers, maxRetries
     const failedWorkflowRuns = await getFailedWorkflowsForCommit(owner, repo, commitSHA, headers);
     const failedCheckRuns = await getFailedCheckRunsForCommit(owner, repo, commitSHA, headers);
     
-    // Check for pending check runs as well
     const checkRunsResp = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${commitSHA}/check-runs`, { headers });
     const checkRunsData = await checkRunsResp.json();
     const pendingCheckRuns = checkRunsData.check_runs.filter(run => run.status !== "completed");
@@ -332,7 +360,6 @@ async function handleFailedWorkflows(owner, repo, commitSHA, headers, maxRetries
         console.error(`Error downloading logs for workflow run #${run.id}: ${err.message}`);
       }
     }
-    // For check runs: extract unique check_suite ids and re-run them.
     const failedCheckSuites = new Set();
     for (const check of failedCheckRuns) {
       if (check.check_suite && check.check_suite.id) {
@@ -346,7 +373,6 @@ async function handleFailedWorkflows(owner, repo, commitSHA, headers, maxRetries
         console.error(`Error re-running check suite ${suiteId}: ${err.message}`);
       }
     }
-    // Re-run individual workflow runs as well.
     for (const run of failedWorkflowRuns) {
       try {
         await reRunWorkflow(owner, repo, run.id, headers);
@@ -379,14 +405,14 @@ async function waitForPRToBeMergeableWithRetries(owner, repo, pullNum, headers) 
       return false;
     }
 
-    // If the review_decision indicates that approval is still required or changes were requested,
-    // then fail and instruct the user to get a team approval.
-    if (!pr.review_decision || pr.review_decision === "REVIEW_REQUIRED" || pr.review_decision === "CHANGES_REQUESTED") {
+    // Check if the PR is approved using our custom function
+    const approved = await isPRApproved(owner, repo, pullNum, headers);
+    if (!approved) {
       console.error("Pull request is not approved. Please get approval from someone on the team before merging.");
       return false;
     }
 
-    // Check the mergeable_state regardless of pr.mergeable
+    // Handle mergeable_state and workflows as before
     if (pr.mergeable_state === "blocked" || pr.mergeable_state === "unstable") {
       console.log(`Detected mergeable_state=${pr.mergeable_state}. Attempting to handle failed workflows/checks...`);
       const commitSHA = pr.head.sha;
@@ -396,23 +422,20 @@ async function waitForPRToBeMergeableWithRetries(owner, repo, pullNum, headers) 
         return false;
       }
       console.log("Workflows restarted. Re-polling soon...");
-      await sleep(5000); // short wait after handling failures
+      await sleep(5000);
       pollCount++;
       continue;
     }
-    // If the pr.mergeable property is false, wait a bit.
     if (!pr.mergeable) {
       console.log("PR mergeable property is false, waiting 30s...");
       await sleep(30000);
       pollCount++;
       continue;
     }
-    // If mergeable_state is "clean", proceed.
     if (pr.mergeable_state === "clean") {
-      console.log("PR is mergeable and 'clean'. All checks passed. Proceeding to merge.");
+      console.log("PR is mergeable and 'clean'. All checks passed and approved. Proceeding to merge.");
       return true;
     }
-    // For any other mergeable_state, wait the default period.
     console.log(`PR mergeable_state=${pr.mergeable_state}. Retrying in 30s...`);
     await sleep(30000);
     pollCount++;
@@ -581,7 +604,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     console.log("\nStarting periodic sync with default branch...");
     await syncBranchWithDefault(defaultBranch, prBranchName);
 
-    console.log("\nWaiting for PR to become mergeable (including workflow/checks and approvals)...");
+    console.log("\nWaiting for PR to become mergeable (including workflow/checks and approval)...");
     const canMerge = await waitForPRToBeMergeableWithRetries(owner, repo, pullNumber, headers);
     if (!canMerge) {
       console.log("Exiting without merge since PR is either merged externally, unmergeable, or not approved.");
