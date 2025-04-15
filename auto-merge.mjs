@@ -12,10 +12,9 @@
 //      - And finally perform a yarn version bump (with patch/minor/major as specified)
 //  • Every dangerous action (file system writes, git changes or API calls) asks for interactive confirmation.
 //  • Periodically (every 1 minute) the script will sync the PR branch with the default branch.
-//  • Finally, if all conditions pass, the script issues a GitHub API merge call (and prints out a cURL command)
-//    to merge the pull request.
-//  • Optionally, if the PR is already merged or after a version bump and a successful merge,
-//    the script will prompt you to push the new tag to the default branch.
+//  • Finally, if all conditions pass and the PR is mergeable (i.e. all checks passed, no conflicts, etc.),
+//    the script issues a GitHub API merge call (and prints out a cURL command) to merge the pull request.
+//  • Optionally, if the PR is already merged or after the merge, the script will prompt you to push a new tag.
 
 import path from "path";
 import fs from "fs";
@@ -230,6 +229,82 @@ function sleep(ms) {
 }
 
 // ---------------------
+// Helper: waitForPRToBeMergeable
+// ---------------------
+async function waitForPRToBeMergeable(owner, repo, pullNum) {
+  // This function polls GitHub's PR API until:
+  //  • The PR is merged (in which case we return false, because there's no need to merge again), or
+  //  • The PR's mergeable is true AND its mergeable_state is 'clean' (all checks/requirements are passing),
+  //    meaning we can do the final merge.
+  while (true) {
+    console.log("Checking if PR is mergeable (waiting for checks/reviews)...");
+    const prRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${pullNum}`, {
+      headers,
+    });
+    if (!prRes.ok) {
+      throw new Error(`Failed to fetch PR details: ${prRes.statusText}`);
+    }
+    const pr = await prRes.json();
+
+    // If the PR is already merged, there's nothing to do.
+    if (pr.merged) {
+      console.log("Pull request is already merged (or became merged externally).");
+      return false; // Return false so we don't attempt a second merge call.
+    }
+
+    // .mergeable can be true, false, or null.
+    // .mergeable_state can be 'clean','blocked','behind','dirty','draft','unstable','has_hooks','unknown'
+    // Typically, "clean" = fully mergeable & checks passed
+    //           "blocked" = something's blocking (review or checks)
+    //           "unstable" = checks haven't completed or failing
+    //           "behind" = needs rebase or merge default branch
+    //           "draft" = can't merge yet
+    //           "dirty" = conflicts
+    //           "unknown" or .mergeable=null means GitHub is still computing
+
+    if (!pr.mergeable) {
+      console.log(
+        `mergeable=${pr.mergeable}, mergeable_state=${pr.mergeable_state}. Possibly waiting on checks or reviews. Will retry in 30s...`
+      );
+      await sleep(30000);
+      continue;
+    }
+
+    // If mergeable is true, look at mergeable_state to see if it’s truly ready:
+    switch (pr.mergeable_state) {
+      case "clean":
+        console.log("PR is mergeable and 'clean'. All checks have passed. Proceeding...");
+        return true;
+      case "blocked":
+      case "behind":
+      case "unstable":
+      case "has_hooks":
+        // In these states, it's typically waiting on checks, behind the branch, or blocked by a required review.
+        console.log(
+          `mergeable_state=${pr.mergeable_state}. Required checks or reviews not yet satisfied (or behind). Retrying in 30s...`
+        );
+        await sleep(30000);
+        break;
+      case "draft":
+      case "dirty":
+      case "unknown":
+        // Usually means a draft PR, or conflicts, or GitHub hasn’t finished calculating yet.
+        // We'll keep waiting a bit in case state changes (some states do).
+        // But if it's in "draft" or "dirty", user action is often required. You may want to exit or keep polling.
+        console.log(
+          `mergeable_state=${pr.mergeable_state}. Possibly a draft or conflict. Retrying in 30s...`
+        );
+        await sleep(30000);
+        break;
+      default:
+        console.log(`Unknown mergeable_state: ${pr.mergeable_state}. Retrying in 30s...`);
+        await sleep(30000);
+        break;
+    }
+  }
+}
+
+// ---------------------
 // Repository Preparation: Clone or Pull as needed and checkout a given branch
 // ---------------------
 async function prepareRepository(repoName, cloneUrl, branchName) {
@@ -280,7 +355,7 @@ async function prepareRepository(repoName, cloneUrl, branchName) {
 async function mergePullRequest() {
   const mergeData = {
     commit_title: `Auto-merge pull request #${pullNumber}`,
-    merge_method: "merge", // change to squash or rebase if preferred
+    merge_method: "merge", // or 'squash'/'rebase' if preferred
   };
 
   const apiUrl = `https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}/merge`;
@@ -385,6 +460,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     console.log(`PR branch package.json version: ${localPkg.version}`);
     debug(`Default pkg version: ${defaultPkg.version}, PR branch pkg version: ${localPkg.version}`);
 
+    // Version bump logic only if PR branch <= default branch
     if (semver.lte(localPkg.version, defaultPkg.version)) {
       console.log("PR branch version is lower or equal to the default branch version.");
       console.log("Merging default branch into PR branch...");
@@ -398,7 +474,6 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       console.log(`Bumping version using "${bumpType}"...`);
       await bumpLocalVersionSafe(bumpType);
       await pushCurrentBranch(prBranchName);
-      // Removed tag push here -- it will be prompted after a successful merge.
     } else {
       console.log("PR branch version is greater than the default branch version. No version bump required.");
     }
@@ -406,12 +481,22 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     console.log("\nStarting periodic sync with default branch...");
     await syncBranchWithDefault(defaultBranch, prBranchName);
 
-    console.log("\nAll updates and checks passed. Proceeding to merge the pull request via GitHub API...");
+    // ------------------------------------------------------------------
+    // Wait for the PR to be fully mergeable (checks, reviews) before merging
+    // ------------------------------------------------------------------
+    const canMerge = await waitForPRToBeMergeable(owner, repo, pullNumber);
+    if (!canMerge) {
+      // Means the PR is already merged or cannot be merged automatically
+      console.log("Exiting without merge, because the PR was either merged externally or is unmergeable.");
+      process.exit(0);
+    }
+
+    console.log("\nAll updates and checks passed, and the PR is mergeable. Proceeding to merge via GitHub API...");
     const mergeResult = await mergePullRequest();
     if (mergeResult.merged) {
       console.log("Pull request merged successfully!");
       debug("Merge result: " + JSON.stringify(mergeResult));
-      // Now that the PR is merged, ask about pushing the tag.
+      // Now that the PR is merged, ask about pushing a new tag
       const pushTag = await confirmAction("Do you want to push the new tag to the default branch?", "git push origin v<new-tag>");
       if (pushTag) {
         await pushNewTag();
