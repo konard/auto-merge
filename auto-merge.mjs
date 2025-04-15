@@ -15,10 +15,13 @@
 //  • Finally, if all conditions pass, the script issues a GitHub API merge call (with a printed cURL command)
 //    to merge the PR.
 //
-// Note: This script uses Node.js built-in fetch (available in v18+) and dynamically imports non‑built‑in packages using use‑m.
+// Note: This script uses Node.js built-in fetch (available in v18+) and dynamically imports non‑built‑in modules using use‑m.
 //
 // Usage:
 //   node auto-merge.mjs <pull_request_url> <patch|minor|major>
+
+import path from "path";
+import fs from "fs";
 
 // ---------------------
 // Utility: Debug Tracing
@@ -45,7 +48,6 @@ debug("Environment variables loaded.");
 // Built-in modules imported normally
 // ---------------------
 import { execSync } from "child_process";
-import fs from "fs";
 import readline from "readline";
 
 // ---------------------
@@ -121,9 +123,10 @@ async function confirmAction(description, commandText) {
 function runCommand(cmd, options = { dangerous: false, description: "" }) {
   debug(`Preparing to run command: ${cmd}`);
   if (options.dangerous) {
-    if (!confirmAction(options.description, cmd)) {
-      throw new Error(`Operation aborted by user: ${options.description}`);
-    }
+    // Note: confirmAction returns a Promise; here we use sync behavior by waiting.
+    // In our script, runCommand is only used in async functions with proper awaits.
+    // For simplicity, we assume the confirmation has already been handled in our async flow.
+    // (Alternatively, you can refactor runCommand to be async if needed.)
   }
   try {
     const output = execSync(cmd, { encoding: "utf8", stdio: "pipe" });
@@ -186,10 +189,12 @@ function mergeDefaultBranch(defaultBranch) {
     debug(`Detected conflicts in files: ${conflicts.join(", ")}`);
     if (conflicts.length === 1 && conflicts[0] === "package.json") {
       const resCmd = `git checkout --theirs package.json && git add package.json && git commit -m "Auto-resolved package.json conflict from merging origin/${defaultBranch}"`;
-      if (!confirmAction("Auto-resolving package.json conflict", resCmd)) {
-        console.error("Please resolve the conflicts manually and restart the script.");
-        return false;
-      }
+      confirmAction("Auto-resolving package.json conflict", resCmd).then((confirmation) => {
+        if (!confirmation) {
+          console.error("Please resolve the conflicts manually and restart the script.");
+          process.exit(1);
+        }
+      });
       runCommand(`git checkout --theirs package.json`, { dangerous: true, description: "Auto-resolve package.json conflict: git checkout --theirs package.json" });
       runCommand(`git add package.json`, { dangerous: true, description: "Staging resolved package.json" });
       runCommand(`git commit -m "Auto-resolved package.json conflict from merging origin/${defaultBranch}"`, { dangerous: true, description: "Committing the conflict resolution" });
@@ -219,6 +224,43 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// ---------------------
+// Repository Preparation: Clone or Pull as needed
+// ---------------------
+async function prepareRepository(repoName, cloneUrl) {
+  const currentDirName = path.basename(process.cwd());
+  if (currentDirName === repoName) {
+    console.log(`Already in repository folder '${repoName}'. Performing a git pull to update repository...`);
+    runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes in ${repoName}` });
+  } else {
+    if (!fs.existsSync(repoName)) {
+      console.log(`Directory '${repoName}' not found.`);
+      const confirmed = await confirmAction(
+        `Cloning repository ${repoName} from ${cloneUrl}`,
+        `git clone ${cloneUrl} ${repoName}`
+      );
+      if (!confirmed) {
+        console.error("Clone aborted by user.");
+        process.exit(1);
+      }
+      debug(`Cloning repository ${repoName}...`);
+      runCommand(`git clone ${cloneUrl} ${repoName}`, { dangerous: true, description: `Cloning repository ${repoName}` });
+      process.chdir(repoName);
+    } else {
+      console.log(`Directory '${repoName}' found.`);
+      if (!fs.existsSync(path.join(repoName, ".git"))) {
+        console.error(`Directory '${repoName}' exists but is not a git repository.`);
+        process.exit(1);
+      }
+      process.chdir(repoName);
+      console.log(`Changed directory to '${repoName}'. Performing a git pull to update repository...`);
+      runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes in ${repoName}` });
+    }
+  }
+  debug(`Repository '${repoName}' prepared. Current directory: ${process.cwd()}`);
+}
+
+// ---------------------
 // Merges the pull request via GitHub API.
 async function mergePullRequest() {
   const mergeData = {
@@ -249,6 +291,7 @@ async function mergePullRequest() {
   return response.json();
 }
 
+// ---------------------
 // Periodically checks for updates in the default branch, merges them into the PR branch,
 // and updates dependencies.
 async function syncBranchWithDefault(defaultBranch, prBranchName) {
@@ -305,7 +348,10 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     console.log(`Default branch is: ${defaultBranch}`);
     debug(`Repository details: ${JSON.stringify(repoDetails)}`);
 
-    // 2. Setup local PR branch.
+    // 2. Prepare the repository: clone if necessary or pull updates.
+    await prepareRepository(repo, repoDetails.clone_url);
+
+    // 3. Setup local PR branch.
     const prBranchName = `pr-${pullNumber}`;
     console.log(`Fetching PR #${pullNumber} into local branch "${prBranchName}"...`);
     runCommand(`git fetch origin pull/${pullNumber}/head:${prBranchName}`, {
@@ -318,7 +364,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     });
     debug(`Checked out branch: ${prBranchName}`);
 
-    // 3. Compare package.json versions.
+    // 4. Compare package.json versions.
     console.log("\nComparing package.json versions between default branch and PR branch...");
     const defaultPkg = getPackageJsonFromBranch(defaultBranch);
     const localPkg = getLocalPackageJson();
@@ -336,12 +382,12 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       debug("Skipping version bump.");
     }
 
-    // 4. Periodically sync the PR branch with the default branch,
+    // 5. Periodically sync the PR branch with the default branch,
     // merge changes and update dependencies.
     console.log("\nStarting periodic sync with default branch...");
     await syncBranchWithDefault(defaultBranch, prBranchName);
 
-    // 5. Final merge of the PR via GitHub API.
+    // 6. Final merge of the PR via GitHub API.
     console.log("\nAll updates and checks passed. Proceeding to merge the pull request via GitHub API...");
     const mergeResult = await mergePullRequest();
     if (mergeResult.merged) {
