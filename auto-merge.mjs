@@ -12,9 +12,11 @@
 //      - And finally perform a yarn version bump (with patch/minor/major as specified)
 //  • Every dangerous action (file system writes, git changes or API calls) asks for interactive confirmation.
 //  • Periodically (every 1 minute) the script will sync the PR branch with the default branch.
-//  • Finally, if all conditions pass and the PR is mergeable (i.e. all checks passed, no conflicts, etc.),
-//    the script issues a GitHub API merge call (and prints out a cURL command) to merge the pull request.
-//  • Optionally, if the PR is already merged or after the merge, the script will prompt you to push a new tag.
+//  • Before merging via GitHub API, the script polls GitHub to verify that all required checks/workflows are passing.
+//      - If a workflow is failing, it downloads its logs and re-runs it.
+//      - After 2 failed re-run attempts, the script aborts and displays the collected logs.
+//  • Finally, if all conditions pass and the PR is marked as mergeable, the script issues the GitHub API merge call.
+//  • Optionally, after a successful merge, the script prompts to push a new tag.
 
 import path from "path";
 import fs from "fs";
@@ -29,7 +31,7 @@ function debug(msg) {
 }
 
 // ---------------------
-// Dynamic Imports via use-m for non built in modules
+// Dynamic Imports via use-m for non built-in modules
 // ---------------------
 debug("Importing use-m to enable dynamic module loading...");
 const { use } = eval(
@@ -41,6 +43,8 @@ debug("Importing dotenv module...");
 const dotenv = await use("dotenv");
 debug("Importing semver module...");
 const semver = await use("semver");
+debug("Importing adm-zip module...");
+const AdmZip = await use("adm-zip");
 dotenv.config();
 debug("Environment variables loaded.");
 
@@ -130,7 +134,7 @@ async function runCommand(cmd, options = { dangerous: false, description: "" }) 
 }
 
 // ---------------------
-// Helper Functions
+// Helper Functions for Repository and Version Bump
 // ---------------------
 
 // Fetch package.json from a given branch (via "git show").
@@ -149,7 +153,7 @@ function getLocalPackageJson() {
   return JSON.parse(content);
 }
 
-// bumpLocalVersionSafe: now safely bumps the version using Yarn's built-in version bump flags.
+// bumpLocalVersionSafe: bumps the version using Yarn's built-in version bump flags.
 async function bumpLocalVersionSafe(bumpType) {
   const cmd = `yarn version --${bumpType}`;
   console.log(`Bumping version using "${cmd}"...`);
@@ -177,8 +181,8 @@ async function pushNewTag() {
 }
 
 // Merges the default branch into the current branch.
-// If only package.json is in conflict, auto-resolve that conflict.
-// Modified to return the merge command output.
+// If only package.json is in conflict, auto-resolves that conflict.
+// Returns the merge command output.
 async function mergeDefaultBranch(defaultBranch) {
   const mergeCmd = `git merge origin/${defaultBranch} --no-edit`;
   const description = `This will merge origin/${defaultBranch} into the current branch.`;
@@ -229,48 +233,130 @@ function sleep(ms) {
 }
 
 // ---------------------
-// Helper: waitForPRToBeMergeable
+// Helpers for Handling Failed Workflow Runs
 // ---------------------
-async function waitForPRToBeMergeable(owner, repo, pullNum) {
-  // This function polls GitHub's PR API until:
-  //  • The PR is merged (in which case we return false, because there's no need to merge again), or
-  //  • The PR's mergeable is true AND its mergeable_state is 'clean' (all checks/requirements are passing),
-  //    meaning we can do the final merge.
-  while (true) {
+
+// getFailedWorkflowsForCommit: Retrieves failed workflow runs for a given commit SHA.
+async function getFailedWorkflowsForCommit(owner, repo, commitSHA, headers) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs?per_page=50`;
+  const resp = await fetch(url, { headers });
+  if (!resp.ok) {
+    throw new Error(`Failed to list workflow runs: ${resp.status} / ${resp.statusText}`);
+  }
+  const data = await resp.json();
+  const runsOnCommit = data.workflow_runs.filter(run => run.head_sha === commitSHA);
+  const failedRuns = runsOnCommit.filter(run => 
+    run.status === "completed" &&
+    (run.conclusion === "failure" || run.conclusion === "timed_out" || run.conclusion === "cancelled")
+  );
+  return failedRuns;
+}
+
+// downloadWorkflowLogs: Downloads logs (.zip) for a given run_id and extracts them.
+async function downloadWorkflowLogs(owner, repo, runId, headers) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/logs`;
+  const resp = await fetch(url, { headers });
+  if (!resp.ok) {
+    throw new Error(`Failed to download logs for run ${runId}: ${resp.status} / ${resp.statusText}`);
+  }
+  const arrayBuffer = await resp.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (!fs.existsSync("logs")) {
+    fs.mkdirSync("logs");
+  }
+  const zipPath = path.join("logs", `run-${runId}.zip`);
+  fs.writeFileSync(zipPath, buffer);
+  const zip = new AdmZip(zipPath);
+  const extractDir = path.join("logs", `run-${runId}`);
+  zip.extractAllTo(extractDir, true);
+  console.log(`Logs for run ${runId} saved in ${extractDir}`);
+  return { zipPath, extractDir };
+}
+
+// reRunWorkflow: Attempts to re-run a given workflow run.
+async function reRunWorkflow(owner, repo, runId, headers) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/rerun`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers,
+  });
+  if (resp.status === 403) {
+    throw new Error(`Forbidden: Could not re-run workflow ${runId}.`);
+  }
+  if (!resp.ok) {
+    throw new Error(`Failed to re-run workflow ${runId}: ${resp.status} / ${resp.statusText}`);
+  }
+  console.log(`Requested re-run for workflow run ${runId}.`);
+}
+
+// handleFailedWorkflows: If failed workflows are detected, downloads logs, re-runs them,
+// and retries (up to maxRetries) until they pass or abort.
+async function handleFailedWorkflows(owner, repo, commitSHA, headers, maxRetries = 2) {
+  let attempt = 0;
+  while (attempt <= maxRetries) {
+    const failedRuns = await getFailedWorkflowsForCommit(owner, repo, commitSHA, headers);
+    if (failedRuns.length === 0) {
+      return true;
+    }
+    console.log(`Found ${failedRuns.length} failed run(s). Attempt ${attempt} of ${maxRetries}.`);
+    for (const run of failedRuns) {
+      console.log(`Downloading logs for failed run #${run.id} (${run.name}).`);
+      try {
+        await downloadWorkflowLogs(owner, repo, run.id, headers);
+      } catch (err) {
+        console.error(`Error downloading logs for run #${run.id}: ${err.message}`);
+      }
+    }
+    if (attempt === maxRetries) {
+      console.error("Max retries reached. Aborting workflow re-run attempts. See logs in the 'logs' folder.");
+      return false;
+    }
+    for (const run of failedRuns) {
+      try {
+        await reRunWorkflow(owner, repo, run.id, headers);
+      } catch (err) {
+        console.error(`Error re-running workflow #${run.id}: ${err.message}`);
+      }
+    }
+    console.log("Waiting 30s for re-run to start...");
+    await sleep(30000);
+    attempt++;
+  }
+  return false;
+}
+
+// ---------------------
+// Extended Wait for Mergeable with Workflow Re-run
+// ---------------------
+async function waitForPRToBeMergeableWithRetries(owner, repo, pullNum, headers) {
+  const maxPollingRounds = 30;
+  let pollCount = 0;
+  while (pollCount < maxPollingRounds) {
     console.log("Checking if PR is mergeable (waiting for checks/reviews)...");
-    const prRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${pullNum}`, {
-      headers,
-    });
+    const prRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${pullNum}`, { headers });
     if (!prRes.ok) {
       throw new Error(`Failed to fetch PR details: ${prRes.statusText}`);
     }
     const pr = await prRes.json();
-
-    // If the PR is already merged, there's nothing to do.
     if (pr.merged) {
-      console.log("Pull request is already merged (or became merged externally).");
-      return false; // Return false so we don't attempt a second merge call.
+      console.log("Pull request is already merged externally.");
+      return false;
     }
-
-    // .mergeable can be true, false, or null.
-    // .mergeable_state can be 'clean','blocked','behind','dirty','draft','unstable','has_hooks','unknown'
-    // Typically, "clean" = fully mergeable & checks passed
-    //           "blocked" = something's blocking (review or checks)
-    //           "unstable" = checks haven't completed or failing
-    //           "behind" = needs rebase or merge default branch
-    //           "draft" = can't merge yet
-    //           "dirty" = conflicts
-    //           "unknown" or .mergeable=null means GitHub is still computing
-
     if (!pr.mergeable) {
-      console.log(
-        `mergeable=${pr.mergeable}, mergeable_state=${pr.mergeable_state}. Possibly waiting on checks or reviews. Will retry in 30s...`
-      );
+      console.log(`mergeable=${pr.mergeable}, mergeable_state=${pr.mergeable_state}. Possibly waiting on checks or reviews.`);
+      if (pr.mergeable_state === "blocked" || pr.mergeable_state === "unstable") {
+        console.log(`mergeable_state=${pr.mergeable_state} => Attempting to handle failed workflows...`);
+        const commitSHA = pr.head.sha;
+        const success = await handleFailedWorkflows(owner, repo, commitSHA, headers, 2);
+        if (!success) {
+          console.error("Failed workflows could not be fixed after 2 attempts. Aborting.");
+          return false;
+        }
+      }
       await sleep(30000);
+      pollCount++;
       continue;
     }
-
-    // If mergeable is true, look at mergeable_state to see if it’s truly ready:
     switch (pr.mergeable_state) {
       case "clean":
         console.log("PR is mergeable and 'clean'. All checks have passed. Proceeding...");
@@ -279,29 +365,21 @@ async function waitForPRToBeMergeable(owner, repo, pullNum) {
       case "behind":
       case "unstable":
       case "has_hooks":
-        // In these states, it's typically waiting on checks, behind the branch, or blocked by a required review.
-        console.log(
-          `mergeable_state=${pr.mergeable_state}. Required checks or reviews not yet satisfied (or behind). Retrying in 30s...`
-        );
+        console.log(`mergeable_state=${pr.mergeable_state}. Will wait and retry in 30s...`);
         await sleep(30000);
         break;
       case "draft":
       case "dirty":
       case "unknown":
-        // Usually means a draft PR, or conflicts, or GitHub hasn’t finished calculating yet.
-        // We'll keep waiting a bit in case state changes (some states do).
-        // But if it's in "draft" or "dirty", user action is often required. You may want to exit or keep polling.
-        console.log(
-          `mergeable_state=${pr.mergeable_state}. Possibly a draft or conflict. Retrying in 30s...`
-        );
-        await sleep(30000);
-        break;
       default:
-        console.log(`Unknown mergeable_state: ${pr.mergeable_state}. Retrying in 30s...`);
+        console.log(`mergeable_state=${pr.mergeable_state}. Possibly a draft or conflict. Retrying in 30s...`);
         await sleep(30000);
         break;
     }
+    pollCount++;
   }
+  console.error("Exceeded max polling rounds waiting for PR to become mergeable. Aborting.");
+  return false;
 }
 
 // ---------------------
@@ -327,8 +405,6 @@ async function prepareRepository(repoName, cloneUrl, branchName) {
       process.chdir(repoName);
     }
   }
-
-  // Check the current branch.
   let currentBranch;
   try {
     currentBranch = execSync("git rev-parse --abbrev-ref HEAD", { encoding: "utf8" }).trim();
@@ -337,7 +413,6 @@ async function prepareRepository(repoName, cloneUrl, branchName) {
     console.error("Failed to get current branch:", e.message);
     process.exit(1);
   }
-
   if (currentBranch === branchName) {
     console.log(`Already on branch "${branchName}", pulling latest changes...`);
     await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for branch ${branchName}` });
@@ -355,12 +430,10 @@ async function prepareRepository(repoName, cloneUrl, branchName) {
 async function mergePullRequest() {
   const mergeData = {
     commit_title: `Auto-merge pull request #${pullNumber}`,
-    merge_method: "merge", // or 'squash'/'rebase' if preferred
+    merge_method: "merge",
   };
-
   const apiUrl = `https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}/merge`;
   const curlCommand = `curl -X PUT ${apiUrl} \\\n  -H "Authorization: token ${token}" \\\n  -H "Content-Type: application/json" \\\n  -d '${JSON.stringify(mergeData)}'`;
-
   if (!(await confirmAction("Merging the pull request via GitHub API", curlCommand))) {
     throw new Error("User aborted GitHub API merge call.");
   }
@@ -370,7 +443,6 @@ async function mergePullRequest() {
     headers,
     body: JSON.stringify(mergeData),
   });
-
   if (!response.ok) {
     const errorData = await response.json();
     throw new Error(`Merge failed: ${errorData.message}`);
@@ -427,8 +499,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     }
     const prDetails = await prResponse.json();
 
-    // If the pull request is already merged, ensure repository is cloned,
-    // check out the default branch, pull latest changes, and offer to push the new tag.
+    // If the pull request is already merged, checkout default branch and optionally push tag.
     if (prDetails.merged) {
       console.log("Pull request is already merged.");
       await prepareRepository(repo, repoDetails.clone_url, defaultBranch);
@@ -450,7 +521,6 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
 
     const prBranchName = prDetails.head.ref;
     console.log(`Pull request branch: ${prBranchName}`);
-
     await prepareRepository(repo, repoDetails.clone_url, prBranchName);
 
     console.log("\nComparing package.json versions between default branch and PR branch...");
@@ -460,7 +530,6 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     console.log(`PR branch package.json version: ${localPkg.version}`);
     debug(`Default pkg version: ${defaultPkg.version}, PR branch pkg version: ${localPkg.version}`);
 
-    // Version bump logic only if PR branch <= default branch
     if (semver.lte(localPkg.version, defaultPkg.version)) {
       console.log("PR branch version is lower or equal to the default branch version.");
       console.log("Merging default branch into PR branch...");
@@ -481,13 +550,10 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     console.log("\nStarting periodic sync with default branch...");
     await syncBranchWithDefault(defaultBranch, prBranchName);
 
-    // ------------------------------------------------------------------
-    // Wait for the PR to be fully mergeable (checks, reviews) before merging
-    // ------------------------------------------------------------------
-    const canMerge = await waitForPRToBeMergeable(owner, repo, pullNumber);
+    // Wait for the PR to be fully mergeable (including passing workflows)
+    const canMerge = await waitForPRToBeMergeableWithRetries(owner, repo, pullNumber, headers);
     if (!canMerge) {
-      // Means the PR is already merged or cannot be merged automatically
-      console.log("Exiting without merge, because the PR was either merged externally or is unmergeable.");
+      console.log("Exiting without merge, because the PR was either merged externally or is unmergeable/failing.");
       process.exit(0);
     }
 
@@ -496,7 +562,6 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     if (mergeResult.merged) {
       console.log("Pull request merged successfully!");
       debug("Merge result: " + JSON.stringify(mergeResult));
-      // Now that the PR is merged, ask about pushing a new tag
       const pushTag = await confirmAction("Do you want to push the new tag to the default branch?", "git push origin v<new-tag>");
       if (pushTag) {
         await pushNewTag();
