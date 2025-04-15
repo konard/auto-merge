@@ -28,7 +28,7 @@ function debug(msg) {
 }
 
 // ---------------------
-// Dynamic Imports via use-m for non built-in modules
+// Dynamic Imports via use-m for non built in modules
 // ---------------------
 debug("Importing use-m to enable dynamic module loading...");
 const { use } = eval(
@@ -239,11 +239,26 @@ async function prepareRepository(repoName, cloneUrl, prBranchName) {
       process.chdir(repoName);
     }
   }
-  console.log(`Checking out PR branch "${prBranchName}"...`);
-  await runCommand(`git fetch origin ${prBranchName}:${prBranchName}`, { dangerous: true, description: `Fetching PR branch ${prBranchName}` });
-  await runCommand(`git checkout -B ${prBranchName} origin/${prBranchName}`, { dangerous: true, description: `Checking out PR branch ${prBranchName}` });
-  console.log(`Pulling latest changes for PR branch "${prBranchName}"...`);
-  await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for PR branch ${prBranchName}` });
+
+  // Check the current branch.
+  let currentBranch;
+  try {
+    currentBranch = execSync("git rev-parse --abbrev-ref HEAD", { encoding: "utf8" }).trim();
+    debug(`Current branch is: ${currentBranch}`);
+  } catch (e) {
+    console.error("Failed to get current branch:", e.message);
+    process.exit(1);
+  }
+
+  if (currentBranch === prBranchName) {
+    console.log(`Already on PR branch "${prBranchName}", pulling latest changes...`);
+    await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for PR branch ${prBranchName}` });
+  } else {
+    console.log(`Checking out PR branch "${prBranchName}"...`);
+    await runCommand(`git checkout -B ${prBranchName} origin/${prBranchName}`, { dangerous: true, description: `Checking out PR branch ${prBranchName}` });
+    console.log(`Pulling latest changes for PR branch "${prBranchName}"...`);
+    await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for PR branch ${prBranchName}` });
+  }
   debug(`Repository '${repoName}' prepared on branch '${prBranchName}'. Current directory: ${process.cwd()}`);
 }
 
