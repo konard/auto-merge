@@ -15,8 +15,10 @@
 //  • Before merging via GitHub API, the script polls GitHub to verify that all required checks/workflows are passing.
 //      - If a workflow or check run is failing, it downloads its logs and re-runs it.
 //      - After 2 failed re-run attempts, the script aborts and displays the collected logs.
+//  • Additionally, if the PR is not approved (i.e. review_decision is "REVIEW_REQUIRED" or "CHANGES_REQUESTED"), 
+//      the script fails and asks the user to get approval from someone on the team.
 //  • Extensive debugging output has been added at each API call and decision point.
-//  • Finally, if all conditions pass and the PR is marked as mergeable, the script issues the GitHub API merge call.
+//  • Finally, if all conditions pass and the PR is marked as mergeable and approved, the script issues the GitHub API merge call.
 //  • Optionally, after a successful merge, the script prompts to push a new tag.
 
 import path from "path";
@@ -32,7 +34,7 @@ function debug(msg) {
 }
 
 // ---------------------
-// Dynamic Imports via use-m for non built-in modules
+// Dynamic Imports via use-m for non built in modules
 // ---------------------
 debug("Importing use-m to enable dynamic module loading...");
 const { use } = eval(await fetch("https://unpkg.com/use-m/use.js").then(u => u.text()));
@@ -361,7 +363,7 @@ async function handleFailedWorkflows(owner, repo, commitSHA, headers, maxRetries
 }
 
 // ---------------------
-// Extended Wait for Mergeable with Workflow/Check Re-run and Extensive Tracing
+// Extended Wait for Mergeable with Workflow/Check Re-run and Approval Check
 // ---------------------
 async function waitForPRToBeMergeableWithRetries(owner, repo, pullNum, headers) {
   const maxPollingRounds = 30;
@@ -371,10 +373,19 @@ async function waitForPRToBeMergeableWithRetries(owner, repo, pullNum, headers) 
     const prRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${pullNum}`, { headers });
     const pr = await prRes.json();
     console.log("Current PR JSON:", JSON.stringify(pr, null, 2));
+
     if (pr.merged) {
       console.log("Pull request is already merged externally.");
       return false;
     }
+
+    // If the review_decision indicates that approval is still required or changes were requested,
+    // then fail and instruct the user to get a team approval.
+    if (!pr.review_decision || pr.review_decision === "REVIEW_REQUIRED" || pr.review_decision === "CHANGES_REQUESTED") {
+      console.error("Pull request is not approved. Please get approval from someone on the team before merging.");
+      return false;
+    }
+
     // Check the mergeable_state regardless of pr.mergeable
     if (pr.mergeable_state === "blocked" || pr.mergeable_state === "unstable") {
       console.log(`Detected mergeable_state=${pr.mergeable_state}. Attempting to handle failed workflows/checks...`);
@@ -389,9 +400,9 @@ async function waitForPRToBeMergeableWithRetries(owner, repo, pullNum, headers) 
       pollCount++;
       continue;
     }
-    // If the pr.mergeable property is false (or not available), wait a bit.
+    // If the pr.mergeable property is false, wait a bit.
     if (!pr.mergeable) {
-      console.log(`PR mergeable property is false, waiting 30s...`);
+      console.log("PR mergeable property is false, waiting 30s...");
       await sleep(30000);
       pollCount++;
       continue;
@@ -570,14 +581,14 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     console.log("\nStarting periodic sync with default branch...");
     await syncBranchWithDefault(defaultBranch, prBranchName);
 
-    console.log("\nWaiting for PR to become mergeable (including workflow/checks)...");
+    console.log("\nWaiting for PR to become mergeable (including workflow/checks and approvals)...");
     const canMerge = await waitForPRToBeMergeableWithRetries(owner, repo, pullNumber, headers);
     if (!canMerge) {
-      console.log("Exiting without merge since PR is either merged externally or unmergeable.");
+      console.log("Exiting without merge since PR is either merged externally, unmergeable, or not approved.");
       process.exit(0);
     }
 
-    console.log("\nAll checks passed and PR is mergeable. Proceeding with merge via GitHub API...");
+    console.log("\nAll checks passed and PR is mergeable and approved. Proceeding with merge via GitHub API...");
     const mergeResult = await mergePullRequest();
     if (mergeResult.merged) {
       console.log("Pull request merged successfully!");
