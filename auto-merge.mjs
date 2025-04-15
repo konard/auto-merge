@@ -223,14 +223,11 @@ function sleep(ms) {
 }
 
 // ---------------------
-// Repository Preparation: Clone or Pull as needed
+// Repository Preparation: Clone or Pull as needed and checkout PR branch
 // ---------------------
-async function prepareRepository(repoName, cloneUrl) {
+async function prepareRepository(repoName, cloneUrl, prBranchName) {
   const currentDirName = path.basename(process.cwd());
-  if (currentDirName === repoName) {
-    console.log(`Already in repository folder '${repoName}'. Performing a git pull to update repository...`);
-    await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes in ${repoName}` });
-  } else {
+  if (currentDirName !== repoName) {
     if (!fs.existsSync(repoName)) {
       console.log(`Directory '${repoName}' not found.`);
       const confirmed = await confirmAction(
@@ -245,17 +242,17 @@ async function prepareRepository(repoName, cloneUrl) {
       await runCommand(`git clone ${cloneUrl} ${repoName}`, { dangerous: true, description: `Cloning repository ${repoName}` });
       process.chdir(repoName);
     } else {
-      console.log(`Directory '${repoName}' found.`);
-      if (!fs.existsSync(path.join(repoName, ".git"))) {
-        console.error(`Directory '${repoName}' exists but is not a git repository.`);
-        process.exit(1);
-      }
       process.chdir(repoName);
-      console.log(`Changed directory to '${repoName}'. Performing a git pull to update repository...`);
-      await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes in ${repoName}` });
     }
   }
-  debug(`Repository '${repoName}' prepared. Current directory: ${process.cwd()}`);
+  // Always fetch and checkout the pull request's branch before any pull.
+  console.log(`Checking out PR branch "${prBranchName}"...`);
+  await runCommand(`git fetch origin ${prBranchName}:${prBranchName}`, { dangerous: true, description: `Fetching PR branch ${prBranchName}` });
+  // Use -B to create/update the local branch and set it to track origin.
+  await runCommand(`git checkout -B ${prBranchName} origin/${prBranchName}`, { dangerous: true, description: `Checking out PR branch ${prBranchName}` });
+  console.log(`Pulling latest changes for PR branch "${prBranchName}"...`);
+  await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for PR branch ${prBranchName}` });
+  debug(`Repository '${repoName}' prepared on branch '${prBranchName}'. Current directory: ${process.cwd()}`);
 }
 
 // ---------------------
@@ -341,10 +338,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     console.log(`Default branch is: ${defaultBranch}`);
     debug(`Repository details: ${JSON.stringify(repoDetails)}`);
 
-    // 2. Prepare the repository: clone if needed or pull updates.
-    await prepareRepository(repo, repoDetails.clone_url);
-
-    // 3. Get pull request details from GitHub API.
+    // 2. Get pull request details from GitHub API.
     console.log("Fetching pull request details...");
     const prResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}`, { headers });
     if (!prResponse.ok) {
@@ -354,13 +348,10 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     const prBranchName = prDetails.head.ref;
     console.log(`Pull request branch: ${prBranchName}`);
 
-    // 4. Setup local PR branch.
-    console.log(`Fetching PR branch "${prBranchName}" from origin...`);
-    await runCommand(`git fetch origin ${prBranchName}:${prBranchName}`, { dangerous: true, description: `Fetching PR branch ${prBranchName}` });
-    await runCommand(`git checkout ${prBranchName}`, { dangerous: true, description: `Checking out PR branch ${prBranchName}` });
-    debug(`Checked out branch: ${prBranchName}`);
+    // 3. Prepare the repository and checkout the PR branch.
+    await prepareRepository(repo, repoDetails.clone_url, prBranchName);
 
-    // 5. Compare package.json versions.
+    // 4. Compare package.json versions.
     console.log("\nComparing package.json versions between default branch and PR branch...");
     const defaultPkg = await getPackageJsonFromBranch(defaultBranch);
     const localPkg = getLocalPackageJson();
@@ -368,7 +359,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     console.log(`PR branch package.json version: ${localPkg.version}`);
     debug(`Default pkg version: ${defaultPkg.version}, PR branch pkg version: ${localPkg.version}`);
 
-    // 6. If PR branch version is lower or equal than default branch version, merge, update deps and bump version.
+    // 5. If PR branch version is lower or equal than default branch version, merge, update deps and bump version.
     if (semver.lte(localPkg.version, defaultPkg.version)) {
       console.log("PR branch version is lower or equal to the default branch version.");
       console.log("Merging default branch into PR branch...");
@@ -382,11 +373,11 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       console.log("PR branch version is greater than the default branch version. No version bump required.");
     }
 
-    // 7. Periodically sync PR branch with the default branch.
+    // 6. Periodically sync PR branch with the default branch.
     console.log("\nStarting periodic sync with default branch...");
     await syncBranchWithDefault(defaultBranch, prBranchName);
 
-    // 8. Final merge of the PR via GitHub API.
+    // 7. Final merge of the PR via GitHub API.
     console.log("\nAll updates and checks passed. Proceeding to merge the pull request via GitHub API...");
     const mergeResult = await mergePullRequest();
     if (mergeResult.merged) {
