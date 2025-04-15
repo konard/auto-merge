@@ -3,22 +3,17 @@
 //
 // This script will:
 //  • Accept a GitHub pull request URL and a version-bump type (patch/minor/major)
-//  • Use the GitHub API (with built-in global fetch) to fetch PR details and commit statuses
+//  • Use the GitHub API (with built‑in global fetch) to fetch PR details and commit statuses
 //  • Get the pull request’s branch (which may be any name provided by the developer)
 //  • Compare package.json versions on the default branch versus the PR branch
 //  • If the PR branch version is lower or equal to the default branch version:
 //      - Merge in the default branch,
-//      - Run yarn install,
+//      - Run yarn install (only if the merge actually brought in new changes),
 //      - And finally perform a yarn version bump (with patch/minor/major as specified)
 //  • Every dangerous action (file system writes, git changes or API calls) asks for interactive confirmation.
 //  • Periodically (every 1 minute) the script will sync the PR branch with the default branch.
 //  • Finally, if all conditions pass, the script issues a GitHub API merge call (and prints out a cURL command)
 //    to merge the pull request.
-//
-// Note: This script uses Node.js built‑in fetch (available in v18+) and dynamically loads non‑built‑in modules via use‑m.
-//
-// Usage:
-//   node auto-merge.mjs <pull_request_url> <patch|minor|major>
 
 import path from "path";
 import fs from "fs";
@@ -155,7 +150,6 @@ function getLocalPackageJson() {
 
 // bumpLocalVersionSafe: now safely bumps the version using Yarn's built-in version bump flags.
 async function bumpLocalVersionSafe(bumpType) {
-  // Using allowed bump types: patch, minor, or major.
   const cmd = `yarn version --${bumpType}`;
   console.log(`Bumping version using "${cmd}"...`);
   await runCommand(cmd, { dangerous: true, description: `This will bump the version using yarn version --${bumpType}` });
@@ -172,17 +166,17 @@ async function pushCurrentBranch(branchName) {
 
 // Merges the default branch into the current branch.
 // If only package.json is in conflict, auto-resolve that conflict.
+// Modified to return the merge command output.
 async function mergeDefaultBranch(defaultBranch) {
   const mergeCmd = `git merge origin/${defaultBranch} --no-edit`;
   const description = `This will merge origin/${defaultBranch} into the current branch.`;
   debug(`Merging default branch (${defaultBranch}) into current branch.`);
   try {
-    await runCommand(mergeCmd, { dangerous: true, description });
-    debug("Merge succeeded without conflicts.");
-    return true; // Merge succeeded.
+    const mergeOutput = await runCommand(mergeCmd, { dangerous: true, description });
+    debug(`Merge output: ${mergeOutput}`);
+    return mergeOutput;
   } catch (e) {
     debug("Merge command failed, checking for conflicts...");
-    // Check for merge conflicts.
     let conflictsOutput = await runCommand(`git diff --name-only --diff-filter=U`, { dangerous: false, description: "Checking merge conflicts" });
     const conflicts = conflictsOutput.split(/\n/).map(s => s.trim()).filter(Boolean);
     debug(`Detected conflicts in files: ${conflicts.join(", ")}`);
@@ -197,13 +191,13 @@ async function mergeDefaultBranch(defaultBranch) {
       await runCommand(`git add package.json`, { dangerous: true, description: "Staging resolved package.json" });
       await runCommand(`git commit -m "Auto-resolved package.json conflict from merging origin/${defaultBranch}"`, { dangerous: true, description: "Committing the conflict resolution" });
       debug("Auto-resolved package.json conflict.");
-      return true;
+      return "Merge completed with auto-resolved conflicts";
     } else if (conflicts.length > 0) {
       console.error("Merge conflicts detected in files:", conflicts);
       console.error("Please resolve these conflicts manually and then restart the script.");
-      return false;
+      return "";
     }
-    return false;
+    return "";
   }
 }
 
@@ -245,10 +239,8 @@ async function prepareRepository(repoName, cloneUrl, prBranchName) {
       process.chdir(repoName);
     }
   }
-  // Always fetch and checkout the pull request's branch before any pull.
   console.log(`Checking out PR branch "${prBranchName}"...`);
   await runCommand(`git fetch origin ${prBranchName}:${prBranchName}`, { dangerous: true, description: `Fetching PR branch ${prBranchName}` });
-  // Use -B to create/update the local branch and set it to track origin.
   await runCommand(`git checkout -B ${prBranchName} origin/${prBranchName}`, { dangerous: true, description: `Checking out PR branch ${prBranchName}` });
   console.log(`Pulling latest changes for PR branch "${prBranchName}"...`);
   await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for PR branch ${prBranchName}` });
@@ -264,7 +256,6 @@ async function mergePullRequest() {
   };
 
   const apiUrl = `https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}/merge`;
-  // Prepare a reproducible cURL command.
   const curlCommand = `curl -X PUT ${apiUrl} \\\n  -H "Authorization: token ${token}" \\\n  -H "Content-Type: application/json" \\\n  -d '${JSON.stringify(mergeData)}'`;
 
   if (!(await confirmAction("Merging the pull request via GitHub API", curlCommand))) {
@@ -296,27 +287,16 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     } catch (e) {
       console.error("Failed to fetch the default branch:", e.message);
     }
-    // Merge default branch into current branch.
-    if (!(await mergeDefaultBranch(defaultBranch))) {
-      debug("Merge failed or conflicts could not be auto-resolved. Exiting...");
-      process.exit(1);
-    }
-    console.log("Merge complete. Running yarn install to update dependencies...");
-    await updateDependencies();
-    await pushCurrentBranch(prBranchName);
-    let mergeCheck;
-    try {
-      mergeCheck = await runCommand(`git merge origin/${defaultBranch} --no-edit 2>&1`, { dangerous: false, description: "Checking merge status" });
-    } catch (e) {
-      mergeCheck = e.message;
-    }
-    debug(`Merge check result: ${mergeCheck}`);
-    if (mergeCheck.includes("Already up to date")) {
-      console.log("PR branch is up-to-date with the default branch.");
-      break;
-    } else {
-      console.log("PR branch updated with new changes from default branch. Re-checking in 1 minute...");
+    const mergeOutput = await mergeDefaultBranch(defaultBranch);
+    if (!mergeOutput.includes("Already up to date")) {
+      console.log("New changes merged from default branch, updating dependencies via yarn install...");
+      await updateDependencies();
+      await pushCurrentBranch(prBranchName);
+      console.log("Dependencies updated. Checking merge status in 1 minute...");
       await sleep(60000);
+    } else {
+      console.log("PR branch is up-to-date with the default branch. Skipping yarn install.");
+      break;
     }
   }
 }
@@ -327,7 +307,6 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
 (async () => {
   try {
     debug("Starting main flow...");
-    // 1. Get repository details from GitHub API.
     console.log("Fetching repository details...");
     const repoResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers });
     if (!repoResponse.ok) {
@@ -338,7 +317,6 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     console.log(`Default branch is: ${defaultBranch}`);
     debug(`Repository details: ${JSON.stringify(repoDetails)}`);
 
-    // 2. Get pull request details from GitHub API.
     console.log("Fetching pull request details...");
     const prResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}`, { headers });
     if (!prResponse.ok) {
@@ -348,10 +326,8 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     const prBranchName = prDetails.head.ref;
     console.log(`Pull request branch: ${prBranchName}`);
 
-    // 3. Prepare the repository and checkout the PR branch.
     await prepareRepository(repo, repoDetails.clone_url, prBranchName);
 
-    // 4. Compare package.json versions.
     console.log("\nComparing package.json versions between default branch and PR branch...");
     const defaultPkg = await getPackageJsonFromBranch(defaultBranch);
     const localPkg = getLocalPackageJson();
@@ -359,13 +335,16 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     console.log(`PR branch package.json version: ${localPkg.version}`);
     debug(`Default pkg version: ${defaultPkg.version}, PR branch pkg version: ${localPkg.version}`);
 
-    // 5. If PR branch version is lower or equal than default branch version, merge, update deps and bump version.
     if (semver.lte(localPkg.version, defaultPkg.version)) {
       console.log("PR branch version is lower or equal to the default branch version.");
       console.log("Merging default branch into PR branch...");
-      await mergeDefaultBranch(defaultBranch);
-      console.log("Running yarn install to update dependencies...");
-      await updateDependencies();
+      const mergeOutput = await mergeDefaultBranch(defaultBranch);
+      if (!mergeOutput.includes("Already up to date")) {
+        console.log("Merge brought in new changes, updating dependencies via yarn install...");
+        await updateDependencies();
+      } else {
+        console.log("No changes detected from merging default branch, skipping yarn install.");
+      }
       console.log(`Bumping version using "${bumpType}"...`);
       await bumpLocalVersionSafe(bumpType);
       await pushCurrentBranch(prBranchName);
@@ -373,11 +352,9 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       console.log("PR branch version is greater than the default branch version. No version bump required.");
     }
 
-    // 6. Periodically sync PR branch with the default branch.
     console.log("\nStarting periodic sync with default branch...");
     await syncBranchWithDefault(defaultBranch, prBranchName);
 
-    // 7. Final merge of the PR via GitHub API.
     console.log("\nAll updates and checks passed. Proceeding to merge the pull request via GitHub API...");
     const mergeResult = await mergePullRequest();
     if (mergeResult.merged) {
