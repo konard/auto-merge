@@ -2,7 +2,7 @@
 // auto-merge.mjs
 //
 // This script will:
-//  • Accept a GitHub pull request URL and a version-bump type (patch/minor/major)
+//  • Accept a GitHub pull request URL and a version‑bump type (patch/minor/major)
 //  • Use the GitHub API (with built‑in global fetch) to fetch PR details and commit statuses
 //  • Get the pull request’s branch (which may be any name provided by the developer)
 //  • Compare package.json versions on the default branch versus the PR branch
@@ -10,19 +10,22 @@
 //      - Merge in the default branch,
 //      - Run yarn install (only if the merge actually brought in new changes),
 //      - And finally perform a yarn version bump (with patch/minor/major as specified)
-//  • Every dangerous action (file system writes, git changes or API calls) asks for interactive confirmation.
+//  • Every dangerous action (file‑system writes, git changes or API calls) asks for interactive confirmation.
 //  • Periodically (every 1 minute) the script will sync the PR branch with the default branch.
 //  • Before merging via GitHub API, the script polls GitHub to verify that all required checks/workflows are passing.
-//      - If a workflow or check run is failing, it downloads its logs and re-runs it.
-//      - After 2 failed re-run attempts, the script aborts and displays the collected logs.
+//      - If a workflow or check run is failing, it downloads its logs and re‑runs it.
+//      - After 2 failed re‑run attempts, the script aborts and displays the collected logs.
 //  • Additionally, if the PR is not approved (i.e. it has not received at least the required approvals),
 //      the script fails and asks the user to get approval from someone on the team.
-//  • Finally, if a merge conflict is detected in package.json the script will only auto-resolve if the only change is in the version field;
+//  • Finally, if a merge conflict is detected in package.json the script will only auto‑resolve if the only change is in the version field;
 //      otherwise, it aborts and asks the user to resolve conflicts manually.
 //  • Extensive debugging output has been added at each API call and decision point.
 //  • If all conditions pass and the PR is mergeable and approved, the script issues the GitHub API merge call.
 //  • Optionally, after a successful merge, the script prompts to push a new tag.
-//  • You can now pass `-y` or `--auto-approve` to skip all interactive confirmations.
+//      - Even in --auto-approve mode this prompt is *always* shown, **unless** --auto-tag is supplied.
+//  • You can now pass:
+//      - `-y` or `--auto-approve` to skip confirmations for *required* steps, and
+//      - `-t` or `--auto-tag` to skip the optional “push tag” confirmation.
 
 import path from "path";
 import fs from "fs";
@@ -67,21 +70,29 @@ debug("GITHUB_TOKEN is set.");
 // ---------------------
 const rawArgs = process.argv.slice(2);
 let autoApprove = false;
+let autoTag = false;
 const args = [];
 for (const arg of rawArgs) {
   if (arg === "-y" || arg === "--auto-approve") {
     autoApprove = true;
     debug(`Auto-approve enabled via flag ${arg}`);
+  } else if (arg === "-t" || arg === "--auto-tag") {
+    autoTag = true;
+    debug(`Auto-tag enabled via flag ${arg}`);
   } else {
     args.push(arg);
   }
 }
-const prUrl = args[0];
+const prUrl   = args[0];
 const bumpType = args[1];
-debug(`Received arguments: prUrl=${prUrl}, bumpType=${bumpType}, autoApprove=${autoApprove}`);
+debug(
+  `Received arguments: prUrl=${prUrl}, bumpType=${bumpType}, autoApprove=${autoApprove}, autoTag=${autoTag}`
+);
 
 if (!prUrl || !bumpType) {
-  console.error("Usage: node auto-merge.mjs [-y|--auto-approve] <pull_request_url> <patch|minor|major>");
+  console.error(
+    "Usage: node auto-merge.mjs [-y|--auto-approve] [-t|--auto-tag] <pull_request_url> <patch|minor|major>"
+  );
   process.exit(1);
 }
 if (!["patch", "minor", "major"].includes(bumpType)) {
@@ -93,7 +104,9 @@ if (!["patch", "minor", "major"].includes(bumpType)) {
 const prRegex = /^https:\/\/github\.com\/([^\/]+)\/([^\/]+)\/pull\/(\d+)/;
 const match = prUrl.match(prRegex);
 if (!match) {
-  console.error("Error: Invalid pull request URL format. Expected format: https://github.com/owner/repo/pull/123");
+  console.error(
+    "Error: Invalid pull request URL format. Expected format: https://github.com/owner/repo/pull/123"
+  );
   process.exit(1);
 }
 const [, owner, repo, pullNumber] = match;
@@ -109,8 +122,14 @@ const headers = {
 // ---------------------
 // Utility: Interactive Confirmation
 // ---------------------
-async function confirmAction(description, commandText) {
-  if (autoApprove) {
+/**
+ * Confirm a dangerous action.
+ * @param {string} description - Human‑readable description of the action.
+ * @param {string} commandText - Reproducible shell/API command for logs.
+ * @param {boolean} allowAuto  - If false, ALWAYS prompt (ignores --auto-approve).
+ */
+async function confirmAction(description, commandText, allowAuto = true) {
+  if (allowAuto && autoApprove) {
     debug(`Auto-approved action: ${description}`);
     return true;
   }
@@ -154,25 +173,29 @@ async function runCommand(cmd, options = { dangerous: false, description: "" }) 
 function isOnlyVersionConflict(filePath) {
   try {
     const content = fs.readFileSync(filePath, "utf8");
-    // If no conflict markers found, it's not conflicted.
-    if (!content.includes("<<<<<<<") || !content.includes("=======") || !content.includes(">>>>>>>")) {
+    if (
+      !content.includes("<<<<<<<") ||
+      !content.includes("=======") ||
+      !content.includes(">>>>>>>")
+    ) {
       return true;
     }
-    // Regular expression to capture a conflict block.
-    // This regex captures text between conflict markers.
     const conflictBlockRegex = /<<<<<<< HEAD([\s\S]*?)=======([\s\S]*?)>>>>>>>/g;
     let match;
     while ((match = conflictBlockRegex.exec(content)) !== null) {
       const blockHead = match[1].trim();
       const blockOther = match[2].trim();
-      // Split the block lines
-      const headLines = blockHead.split("\n").map(line => line.trim()).filter(line => line.length > 0);
-      const otherLines = blockOther.split("\n").map(line => line.trim()).filter(line => line.length > 0);
-      // We expect exactly one line in each block if only the version field is conflicted.
+      const headLines = blockHead
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+      const otherLines = blockOther
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
       if (headLines.length !== 1 || otherLines.length !== 1) {
         return false;
       }
-      // Use a regex to test if the line is for the version property.
       const versionLineRegex = /^"version":\s*".+",?$/;
       if (!versionLineRegex.test(headLines[0]) || !versionLineRegex.test(otherLines[0])) {
         return false;
@@ -205,7 +228,10 @@ function getLocalPackageJson() {
 async function bumpLocalVersionSafe(bumpType) {
   const cmd = `yarn version --${bumpType}`;
   console.log(`Bumping version using "${cmd}"...`);
-  await runCommand(cmd, { dangerous: true, description: `This will bump the version using yarn version --${bumpType}` });
+  await runCommand(cmd, {
+    dangerous: true,
+    description: `This will bump the version using yarn version --${bumpType}`,
+  });
   console.log("Version bump performed.");
 }
 
@@ -219,6 +245,19 @@ async function pushCurrentBranch(branchName) {
 async function pushNewTag() {
   const localPkg = getLocalPackageJson();
   const tagName = `v${localPkg.version}`;
+
+  // create the tag locally if it doesn't exist
+  try {
+    execSync(`git rev-parse -q --verify refs/tags/${tagName}`, { stdio: "ignore" });
+    debug(`Local tag ${tagName} already exists.`);
+  } catch {
+    debug(`Local tag ${tagName} not found; creating it.`);
+    await runCommand(`git tag ${tagName}`, {
+      dangerous: true,
+      description: `Create local tag ${tagName}`,
+    });
+  }
+
   const cmd = `git push origin ${tagName}`;
   const description = `This will push the new tag ${tagName} to origin.`;
   debug(`Pushing new tag ${tagName} to origin.`);
@@ -236,26 +275,46 @@ async function mergeDefaultBranch(defaultBranch) {
     return mergeOutput;
   } catch (e) {
     debug("Merge command failed, checking for conflicts...");
-    const conflictsOutput = await runCommand(`git diff --name-only --diff-filter=U`, { dangerous: false, description: "Checking merge conflicts" });
-    const conflicts = conflictsOutput.split(/\n/).map(s => s.trim()).filter(Boolean);
+    const conflictsOutput = await runCommand(`git diff --name-only --diff-filter=U`, {
+      dangerous: false,
+      description: "Checking merge conflicts",
+    });
+    const conflicts = conflictsOutput
+      .split(/\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
     debug(`Detected conflicts in files: ${conflicts.join(", ")}`);
-    // Only auto-resolve if the only conflict is package.json
     if (conflicts.length === 1 && conflicts[0] === "package.json") {
-      // Check that the conflict in package.json is solely in the "version" field.
       if (isOnlyVersionConflict("package.json")) {
-        const resCmd = `git checkout --theirs package.json && git add package.json && git commit -m "Auto-resolved package.json version conflict from merging origin/${defaultBranch}"`;
-        const confirmation = await confirmAction("Auto-resolving package.json conflict on the version field", resCmd);
+        const resCmd =
+          `git checkout --theirs package.json && git add package.json && ` +
+          `git commit -m "Auto-resolved package.json version conflict from merging origin/${defaultBranch}"`;
+        const confirmation = await confirmAction(
+          "Auto-resolving package.json conflict on the version field",
+          resCmd
+        );
         if (!confirmation) {
           console.error("Please resolve the conflicts manually and restart the script.");
           process.exit(1);
         }
-        await runCommand(`git checkout --theirs package.json`, { dangerous: true, description: "Auto-resolve package.json conflict" });
-        await runCommand(`git add package.json`, { dangerous: true, description: "Staging resolved package.json" });
-        await runCommand(`git commit -m "Auto-resolved package.json version conflict from merging origin/${defaultBranch}"`, { dangerous: true, description: "Committing the conflict resolution" });
+        await runCommand(`git checkout --theirs package.json`, {
+          dangerous: true,
+          description: "Auto-resolve package.json conflict",
+        });
+        await runCommand(`git add package.json`, {
+          dangerous: true,
+          description: "Staging resolved package.json",
+        });
+        await runCommand(
+          `git commit -m "Auto-resolved package.json version conflict from merging origin/${defaultBranch}"`,
+          { dangerous: true, description: "Committing the conflict resolution" }
+        );
         debug("Auto-resolved package.json conflict on version field.");
         return "Merge completed with auto-resolved package.json version conflict";
       } else {
-        console.error("Conflict in package.json involves changes beyond the version field. Please resolve manually.");
+        console.error(
+          "Conflict in package.json involves changes beyond the version field. Please resolve manually."
+        );
         process.exit(1);
       }
     } else if (conflicts.length > 0) {
@@ -277,7 +336,7 @@ async function updateDependencies() {
 
 function sleep(ms) {
   debug(`Sleeping for ${ms} ms...`);
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ---------------------
@@ -292,15 +351,18 @@ async function isPRApproved(owner, repo, pullNumber, headers) {
   }
   const reviews = await response.json();
   const reviewMap = new Map();
-  reviews.forEach(review => {
+  reviews.forEach((review) => {
     if (!review.submitted_at) return;
     const username = review.user.login;
-    if (!reviewMap.has(username) || new Date(review.submitted_at) > new Date(reviewMap.get(username).submitted_at)) {
+    if (
+      !reviewMap.has(username) ||
+      new Date(review.submitted_at) > new Date(reviewMap.get(username).submitted_at)
+    ) {
       reviewMap.set(username, review);
     }
   });
   let approvedCount = 0;
-  reviewMap.forEach(review => {
+  reviewMap.forEach((review) => {
     if (review.state.toUpperCase() === "APPROVED") {
       approvedCount++;
     }
@@ -606,7 +668,10 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     debug(`Repository details: ${JSON.stringify(repoDetails)}`);
 
     console.log("Fetching pull request details...");
-    const prResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}`, { headers });
+    const prResponse = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/pulls/${pullNumber}`,
+      { headers }
+    );
     if (!prResponse.ok) {
       throw new Error(`Failed to fetch pull request details: ${prResponse.statusText}`);
     }
@@ -616,14 +681,26 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     if (prDetails.merged) {
       console.log("PR already merged. Preparing default branch...");
       await prepareRepository(repo, repoDetails.clone_url, defaultBranch);
-      let currentBranch = execSync("git rev-parse --abbrev-ref HEAD", { encoding: "utf8" }).trim();
+      let currentBranch = execSync("git rev-parse --abbrev-ref HEAD", {
+        encoding: "utf8",
+      }).trim();
       if (currentBranch !== defaultBranch) {
         console.log(`Not on default branch. Checking out "${defaultBranch}"...`);
-        await runCommand(`git checkout ${defaultBranch}`, { dangerous: true, description: `Checking out default branch ${defaultBranch}` });
+        await runCommand(`git checkout ${defaultBranch}`, {
+          dangerous: true,
+          description: `Checking out default branch ${defaultBranch}`,
+        });
       }
       console.log(`Pulling latest changes for "${defaultBranch}"...`);
-      await runCommand(`git pull`, { dangerous: true, description: `Pulling latest changes for branch ${defaultBranch}` });
-      const pushTag = await confirmAction("Do you want to push the new tag to the default branch?", "git push origin v<new-tag>");
+      await runCommand(`git pull`, {
+        dangerous: true,
+        description: `Pulling latest changes for branch ${defaultBranch}`,
+      });
+      const pushTag = await confirmAction(
+        "Do you want to push the new tag to the default branch?",
+        "git push origin v<new-tag>",
+        autoTag            // auto-approve only if --auto-tag supplied
+      );
       if (pushTag) {
         await pushNewTag();
       } else {
@@ -644,7 +721,9 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     debug(`Default version: ${defaultPkg.version}, PR branch version: ${localPkg.version}`);
 
     if (semver.lte(localPkg.version, defaultPkg.version)) {
-      console.log("PR branch version is less than or equal to the default branch version. Merging default branch into PR branch...");
+      console.log(
+        "PR branch version is less than or equal to the default branch version. Merging default branch into PR branch..."
+      );
       const mergeOutput = await mergeDefaultBranch(defaultBranch);
       if (!mergeOutput.includes("Already up to date")) {
         console.log("Merge brought changes. Updating dependencies...");
@@ -656,25 +735,37 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       await bumpLocalVersionSafe(bumpType);
       await pushCurrentBranch(prBranchName);
     } else {
-      console.log("PR branch version is greater than default branch version. No version bump required.");
+      console.log(
+        "PR branch version is greater than default branch version. No version bump required."
+      );
     }
 
     console.log("\nStarting periodic sync with default branch...");
     await syncBranchWithDefault(defaultBranch, prBranchName);
 
-    console.log("\nWaiting for PR to become mergeable (including workflow/checks and approval)...");
+    console.log(
+      "\nWaiting for PR to become mergeable (including workflow/checks and approval)..."
+    );
     const canMerge = await waitForPRToBeMergeableWithRetries(owner, repo, pullNumber, headers);
     if (!canMerge) {
-      console.log("Exiting without merge since PR is either merged externally, unmergeable, or not approved.");
+      console.log(
+        "Exiting without merge since PR is either merged externally, unmergeable, or not approved."
+      );
       process.exit(0);
     }
 
-    console.log("\nAll checks passed and PR is mergeable and approved. Proceeding with merge via GitHub API...");
+    console.log(
+      "\nAll checks passed and PR is mergeable and approved. Proceeding with merge via GitHub API..."
+    );
     const mergeResult = await mergePullRequest();
     if (mergeResult.merged) {
       console.log("Pull request merged successfully!");
       debug("Merge result: " + JSON.stringify(mergeResult));
-      const pushTag = await confirmAction("Do you want to push the new tag to the default branch?", "git push origin v<new-tag>");
+      const pushTag = await confirmAction(
+        "Do you want to push the new tag to the default branch?",
+        "git push origin v<new-tag>",
+        autoTag            // auto-approve only if --auto-tag supplied
+      );
       if (pushTag) {
         await pushNewTag();
       } else {
