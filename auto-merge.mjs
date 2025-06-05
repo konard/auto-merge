@@ -51,6 +51,9 @@ debug("Importing semver module...");
 const semver = await use("semver");
 debug("Importing adm-zip module...");
 const AdmZip = await use("adm-zip");
+debug("Importing yargs module...");
+const yargs = await use("yargs/yargs");
+const { hideBin } = await use("yargs/helpers");
 
 dotenv.config();
 debug("Environment variables loaded.");
@@ -66,53 +69,76 @@ if (!token) {
 debug("GITHUB_TOKEN is set.");
 
 // ---------------------
-// Configuration and Input Parsing
+// Configuration and Input Parsing with yargs
 // ---------------------
-const rawArgs = process.argv.slice(2);
-let autoApprove = false;
-let autoTag = false;
-let noTag = false;
-const args = [];
-for (const arg of rawArgs) {
-  if (arg === "-y" || arg === "--auto-approve") {
-    autoApprove = true;
-    debug(`Auto-approve enabled via flag ${arg}`);
-  } else if (arg === "-t" || arg === "--auto-tag") {
-    autoTag = true;
-    debug(`Auto-tag enabled via flag ${arg}`);
-  } else if (arg === "--no-tag") {
-    noTag = true;
-    debug(`No-tag enabled via flag ${arg}`);
-  } else {
-    args.push(arg);
-  }
-}
-const prUrl   = args[0];
-const bumpType = args[1];
-debug(
-  `Received arguments: prUrl=${prUrl}, bumpType=${bumpType}, autoApprove=${autoApprove}, autoTag=${autoTag}, noTag=${noTag}`
-);
+const argv = yargs(hideBin(process.argv))
+  .usage('Usage: $0 [options] <pull_request_url> <patch|minor|major>')
+  .option('auto-approve', {
+    alias: 'y',
+    type: 'boolean',
+    description: 'Skip confirmations for required steps',
+    default: false
+  })
+  .option('auto-tag', {
+    alias: 't',
+    type: 'boolean',
+    description: 'Skip the optional "push tag" confirmation',
+    default: false
+  })
+  .option('no-tag', {
+    type: 'boolean',
+    description: 'Skip tag push entirely (when combined with --auto-approve, no interactive input will be required)',
+    default: false
+  })
+  .positional('pull_request_url', {
+    type: 'string',
+    description: 'The GitHub pull request URL to process',
+    coerce: (url) => {
+      const prRegex = /^https:\/\/github\.com\/([^\/]+)\/([^\/]+)\/pull\/(\d+)/;
+      const match = url.match(prRegex);
+      if (!match) {
+        throw new Error('Invalid pull request URL format. Expected format: https://github.com/owner/repo/pull/123');
+      }
+      return url;
+    }
+  })
+  .positional('bump_type', {
+    type: 'string',
+    description: 'Version bump type (patch, minor, or major)',
+    choices: ['patch', 'minor', 'major'],
+    coerce: (type) => {
+      if (!['patch', 'minor', 'major'].includes(type)) {
+        throw new Error('Bump type must be one of: patch, minor, major');
+      }
+      return type;
+    }
+  })
+  .check((argv) => {
+    if (!argv._[0] || !argv._[1]) {
+      throw new Error('Both pull request URL and bump type are required');
+    }
+    return true;
+  })
+  .help()
+  .alias('help', 'h')
+  .version()
+  .alias('version', 'v')
+  .epilog('For more information, visit: https://github.com/yourusername/auto-merge')
+  .parse();
 
-if (!prUrl || !bumpType) {
-  console.error(
-    "Usage: node auto-merge.mjs [-y|--auto-approve] [-t|--auto-tag] [--no-tag] <pull_request_url> <patch|minor|major>"
-  );
-  process.exit(1);
-}
-if (!["patch", "minor", "major"].includes(bumpType)) {
-  console.error("Error: Bump type must be one of: patch, minor, major");
-  process.exit(1);
-}
+const prUrl = argv._[0];
+const bumpType = argv._[1];
+const autoApprove = argv.autoApprove;
+const autoTag = argv.autoTag;
+const noTag = argv.noTag;
+
+debug(
+  `Parsed arguments: prUrl=${prUrl}, bumpType=${bumpType}, autoApprove=${autoApprove}, autoTag=${autoTag}, noTag=${noTag}`
+);
 
 // Extract owner, repo, and pull request number from the URL.
 const prRegex = /^https:\/\/github\.com\/([^\/]+)\/([^\/]+)\/pull\/(\d+)/;
 const match = prUrl.match(prRegex);
-if (!match) {
-  console.error(
-    "Error: Invalid pull request URL format. Expected format: https://github.com/owner/repo/pull/123"
-  );
-  process.exit(1);
-}
 const [, owner, repo, pullNumber] = match;
 debug(`Parsed PR URL: owner=${owner}, repo=${repo}, pullNumber=${pullNumber}`);
 
