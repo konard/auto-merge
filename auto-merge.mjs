@@ -4,7 +4,7 @@
 // This script will:
 //  • Accept a GitHub pull request URL and a version‑bump type (patch/minor/major)
 //  • Use the GitHub API (with built‑in global fetch) to fetch PR details and commit statuses
-//  • Get the pull request’s branch (which may be any name provided by the developer)
+//  • Get the pull request's branch (which may be any name provided by the developer)
 //  • Compare package.json versions on the default branch versus the PR branch
 //  • If the PR branch version is lower or equal to the default branch version and the PR is not already merged:
 //      - Merge in the default branch,
@@ -25,7 +25,7 @@
 //      - Even in --auto-approve mode this prompt is *always* shown, **unless** --auto-tag is supplied.
 //  • You can now pass:
 //      - `-y` or `--auto-approve` to skip confirmations for *required* steps, and
-//      - `-t` or `--auto-tag` to skip the optional “push tag” confirmation.
+//      - `-t` or `--auto-tag` to skip the optional "push tag" confirmation.
 
 import path from "path";
 import fs from "fs";
@@ -71,6 +71,7 @@ debug("GITHUB_TOKEN is set.");
 const rawArgs = process.argv.slice(2);
 let autoApprove = false;
 let autoTag = false;
+let noTag = false;
 const args = [];
 for (const arg of rawArgs) {
   if (arg === "-y" || arg === "--auto-approve") {
@@ -79,6 +80,9 @@ for (const arg of rawArgs) {
   } else if (arg === "-t" || arg === "--auto-tag") {
     autoTag = true;
     debug(`Auto-tag enabled via flag ${arg}`);
+  } else if (arg === "--no-tag") {
+    noTag = true;
+    debug(`No-tag enabled via flag ${arg}`);
   } else {
     args.push(arg);
   }
@@ -86,12 +90,12 @@ for (const arg of rawArgs) {
 const prUrl   = args[0];
 const bumpType = args[1];
 debug(
-  `Received arguments: prUrl=${prUrl}, bumpType=${bumpType}, autoApprove=${autoApprove}, autoTag=${autoTag}`
+  `Received arguments: prUrl=${prUrl}, bumpType=${bumpType}, autoApprove=${autoApprove}, autoTag=${autoTag}, noTag=${noTag}`
 );
 
 if (!prUrl || !bumpType) {
   console.error(
-    "Usage: node auto-merge.mjs [-y|--auto-approve] [-t|--auto-tag] <pull_request_url> <patch|minor|major>"
+    "Usage: node auto-merge.mjs [-y|--auto-approve] [-t|--auto-tag] [--no-tag] <pull_request_url> <patch|minor|major>"
   );
   process.exit(1);
 }
@@ -697,15 +701,19 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
         dangerous: true,
         description: `Pulling latest changes for branch ${defaultBranch}`,
       });
-      const pushTag = await confirmAction(
-        "Do you want to push the new tag to the default branch?",
-        "git push origin v<new-tag>",
-        autoTag            // auto-approve only if --auto-tag supplied
-      );
-      if (pushTag) {
-        await pushNewTag();
+      if (noTag) {
+        console.log("Skipping tag push (--no-tag specified).");
       } else {
-        console.log("Skipping tag push.");
+        const pushTag = await confirmAction(
+          "Do you want to push the new tag to the default branch?",
+          "git push origin v<new-tag>",
+          autoTag            // auto-approve only if --auto-tag supplied
+        );
+        if (pushTag) {
+          await pushNewTag();
+        } else {
+          console.log("Skipping tag push.");
+        }
       }
       process.exit(0);
     }
@@ -762,15 +770,19 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     if (mergeResult.merged) {
       console.log("Pull request merged successfully!");
       debug("Merge result: " + JSON.stringify(mergeResult));
-      const pushTag = await confirmAction(
-        "Do you want to push the new tag to the default branch?",
-        "git push origin v<new-tag>",
-        autoTag            // auto-approve only if --auto-tag supplied
-      );
-      if (pushTag) {
-        await pushNewTag();
+      if (noTag) {
+        console.log("Skipping tag push (--no-tag specified).");
       } else {
-        console.log("Skipping tag push.");
+        const pushTag = await confirmAction(
+          "Do you want to push the new tag to the default branch?",
+          "git push origin v<new-tag>",
+          autoTag            // auto-approve only if --auto-tag supplied
+        );
+        if (pushTag) {
+          await pushNewTag();
+        } else {
+          console.log("Skipping tag push.");
+        }
       }
     } else {
       console.error("Merge failed:", mergeResult.message);
