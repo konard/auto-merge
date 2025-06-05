@@ -35,7 +35,7 @@ import readline from "readline";
 // ---------------------
 // Utility: Debug Tracing
 // ---------------------
-function debug(msg) {
+let debug = (msg) => {
   console.log(`[DEBUG] ${msg}`);
 }
 
@@ -52,10 +52,13 @@ const semver = await use("semver");
 debug("Importing adm-zip module...");
 const AdmZip = await use("adm-zip");
 debug("Importing yargs module...");
-const yargs = await use("yargs/yargs");
-const { hideBin } = await use("yargs/helpers");
+const { default: yargs } = await use("yargs");
 debug("Importing debug module...");
-const createDebug = await use("debug");
+const { default: createDebug } = await use("debug");
+
+function hideBin(argv) {
+  return argv.slice(2);
+}
 
 // Create debug namespaces
 const debugMain = createDebug('auto-merge:main');
@@ -65,10 +68,7 @@ const debugWorkflow = createDebug('auto-merge:workflow');
 const debugVersion = createDebug('auto-merge:version');
 const debugConfig = createDebug('auto-merge:config');
 
-// Replace the old debug function with our namespaced debug
-function debug(msg) {
-  debugMain(msg);
-}
+debug = debugMain;
 
 dotenv.config();
 debugConfig("Environment variables loaded.");
@@ -566,7 +566,7 @@ async function waitForPRToBeMergeableWithRetries(owner, repo, pullNum, headers) 
     console.log("Polling PR for mergeability...");
     const prRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${pullNum}`, { headers });
     const pr = await prRes.json();
-    console.log("Current PR JSON:", JSON.stringify(pr, null, 2));
+    debugApi("Current PR JSON:", JSON.stringify(pr, null, 2));
 
     if (pr.merged) {
       console.log("Pull request is already merged externally.");
