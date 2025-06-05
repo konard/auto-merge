@@ -54,9 +54,24 @@ const AdmZip = await use("adm-zip");
 debug("Importing yargs module...");
 const yargs = await use("yargs/yargs");
 const { hideBin } = await use("yargs/helpers");
+debug("Importing debug module...");
+const createDebug = await use("debug");
+
+// Create debug namespaces
+const debugMain = createDebug('auto-merge:main');
+const debugGit = createDebug('auto-merge:git');
+const debugApi = createDebug('auto-merge:api');
+const debugWorkflow = createDebug('auto-merge:workflow');
+const debugVersion = createDebug('auto-merge:version');
+const debugConfig = createDebug('auto-merge:config');
+
+// Replace the old debug function with our namespaced debug
+function debug(msg) {
+  debugMain(msg);
+}
 
 dotenv.config();
-debug("Environment variables loaded.");
+debugConfig("Environment variables loaded.");
 
 // ---------------------
 // Check required environment variable: GITHUB_TOKEN
@@ -66,7 +81,7 @@ if (!token) {
   console.error("Error: Please set GITHUB_TOKEN as an environment variable.");
   process.exit(1);
 }
-debug("GITHUB_TOKEN is set.");
+debugConfig("GITHUB_TOKEN is set.");
 
 // ---------------------
 // Configuration and Input Parsing with yargs
@@ -180,7 +195,7 @@ async function confirmAction(description, commandText, allowAuto = true) {
 // Utility: runCommand – Execute shell commands with optional confirmation.
 // ---------------------
 async function runCommand(cmd, options = { dangerous: false, description: "" }) {
-  debug(`Preparing to run command: ${cmd}`);
+  debugGit(`Preparing to run command: ${cmd}`);
   if (options.dangerous) {
     const confirmed = await confirmAction(options.description, cmd);
     if (!confirmed) {
@@ -189,10 +204,10 @@ async function runCommand(cmd, options = { dangerous: false, description: "" }) 
   }
   try {
     const output = execSync(cmd, { encoding: "utf8", stdio: "pipe" });
-    debug(`Command output: ${output}`);
+    debugGit(`Command output: ${output}`);
     return output;
   } catch (err) {
-    debug(`Command error output: ${err.message}`);
+    debugGit(`Command error output: ${err.message}`);
     throw new Error(`Command failed: ${cmd}\n${err.message}`);
   }
 }
@@ -242,16 +257,16 @@ function isOnlyVersionConflict(filePath) {
 // Helper Functions for Repository and Version Bump
 // ---------------------
 async function getPackageJsonFromBranch(branch) {
-  debug(`Fetching package.json from branch: ${branch}`);
+  debugVersion(`Fetching package.json from branch: ${branch}`);
   const content = await runCommand(`git show origin/${branch}:package.json`);
-  debug(`Fetched package.json content from ${branch}`);
+  debugVersion(`Fetched package.json content from ${branch}`);
   return JSON.parse(content);
 }
 
 function getLocalPackageJson() {
-  debug("Reading local package.json file...");
+  debugVersion("Reading local package.json file...");
   const content = fs.readFileSync("package.json", "utf8");
-  debug("Successfully read local package.json.");
+  debugVersion("Successfully read local package.json.");
   return JSON.parse(content);
 }
 
@@ -380,6 +395,7 @@ async function isPRApproved(owner, repo, pullNumber, headers) {
     throw new Error(`Failed to fetch reviews: ${response.status} ${response.statusText}`);
   }
   const reviews = await response.json();
+  debugApi("Reviews response:", JSON.stringify(reviews, null, 2));
   const reviewMap = new Map();
   reviews.forEach((review) => {
     if (!review.submitted_at) return;
@@ -407,30 +423,30 @@ async function isPRApproved(owner, repo, pullNumber, headers) {
 // ---------------------
 async function getFailedWorkflowsForCommit(owner, repo, commitSHA, headers) {
   const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs?per_page=50`;
-  debug(`GET ${url}`);
+  debugApi(`GET ${url}`);
   const resp = await fetch(url, { headers });
   const data = await resp.json();
-  console.log("ALL WORKFLOW RUNS RESPONSE:", JSON.stringify(data, null, 2));
+  debugApi("ALL WORKFLOW RUNS RESPONSE:", JSON.stringify(data, null, 2));
   const runsOnCommit = data.workflow_runs.filter(run => run.head_sha === commitSHA);
-  console.log(`Workflow runs for commit ${commitSHA}:`, JSON.stringify(runsOnCommit, null, 2));
+  debugApi(`Workflow runs for commit ${commitSHA}:`, JSON.stringify(runsOnCommit, null, 2));
   const failedRuns = runsOnCommit.filter(
     run => run.status === "completed" &&
            (run.conclusion === "failure" || run.conclusion === "timed_out" || run.conclusion === "cancelled")
   );
-  console.log(`Failed workflow runs for commit ${commitSHA}:`, JSON.stringify(failedRuns, null, 2));
+  debugApi(`Failed workflow runs for commit ${commitSHA}:`, JSON.stringify(failedRuns, null, 2));
   return failedRuns;
 }
 
 async function getFailedCheckRunsForCommit(owner, repo, commitSHA, headers) {
   const url = `https://api.github.com/repos/${owner}/${repo}/commits/${commitSHA}/check-runs`;
-  debug(`GET ${url}`);
+  debugApi(`GET ${url}`);
   const resp = await fetch(url, { headers });
   const data = await resp.json();
-  console.log("ALL CHECK RUNS RESPONSE:", JSON.stringify(data, null, 2));
+  debugApi("ALL CHECK RUNS RESPONSE:", JSON.stringify(data, null, 2));
   const failedCheckRuns = data.check_runs.filter(
     run => run.conclusion === "failure" || run.conclusion === "timed_out" || run.conclusion === "cancelled"
   );
-  console.log(`Failed check runs for commit ${commitSHA}:`, JSON.stringify(failedCheckRuns, null, 2));
+  debugApi(`Failed check runs for commit ${commitSHA}:`, JSON.stringify(failedCheckRuns, null, 2));
   return failedCheckRuns;
 }
 
@@ -494,10 +510,11 @@ async function handleFailedWorkflows(owner, repo, commitSHA, headers, maxRetries
     // Get pending check runs
     const checkRunsResp = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${commitSHA}/check-runs`, { headers });
     const checkRunsData = await checkRunsResp.json();
+    debugWorkflow("Check runs response:", JSON.stringify(checkRunsData, null, 2));
     const pendingCheckRuns = checkRunsData.check_runs.filter(run => run.status !== "completed");
 
     if (failedWorkflowRuns.length > 0 || failedCheckRuns.length > 0) {
-      console.log(`Found ${failedWorkflowRuns.length} failed workflow run(s) and ${failedCheckRuns.length} failed check run(s).`);
+      debugWorkflow(`Found ${failedWorkflowRuns.length} failed workflow run(s) and ${failedCheckRuns.length} failed check run(s).`);
       // Re-run failed workflow runs
       for (const run of failedWorkflowRuns) {
         console.log(`Requesting re-run for failed workflow run #${run.id} (${run.name})...`);
@@ -687,16 +704,16 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
 // ---------------------
 (async () => {
   try {
-    debug("Starting main flow...");
+    debugMain("Starting main flow...");
     console.log("Fetching repository details...");
     const repoResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers });
     if (!repoResponse.ok) {
       throw new Error(`Failed to fetch repository details: ${repoResponse.statusText}`);
     }
     const repoDetails = await repoResponse.json();
+    debugApi("Repository details:", JSON.stringify(repoDetails, null, 2));
     const defaultBranch = repoDetails.default_branch;
     console.log(`Default branch: ${defaultBranch}`);
-    debug(`Repository details: ${JSON.stringify(repoDetails)}`);
 
     console.log("Fetching pull request details...");
     const prResponse = await fetch(
@@ -707,7 +724,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       throw new Error(`Failed to fetch pull request details: ${prResponse.statusText}`);
     }
     const prDetails = await prResponse.json();
-    console.log("Pull request details:", JSON.stringify(prDetails, null, 2));
+    debugApi("Pull request details:", JSON.stringify(prDetails, null, 2));
 
     if (prDetails.merged) {
       console.log("PR already merged. Preparing default branch...");
@@ -816,7 +833,7 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     }
   } catch (error) {
     console.error("Error:", error.message);
-    debug("Script terminating due to error.");
+    debugMain("Script terminating due to error.");
     process.exit(1);
   }
 })();
