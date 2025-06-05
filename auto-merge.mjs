@@ -453,7 +453,7 @@ async function reRunCheckSuite(owner, repo, checkSuiteId, headers) {
   console.log(`Requested re-run for check suite ${checkSuiteId}.`);
 }
 
-async function handleFailedWorkflows(owner, repo, commitSHA, headers, maxRetries = 2) {
+async function handleFailedWorkflows(owner, repo, commitSHA, headers, maxRetries = 100) {
   let attempt = 0;
   while (attempt <= maxRetries) {
     console.log(`Checking for failed workflows and check runs (attempt ${attempt} of ${maxRetries}) for commit ${commitSHA}...`);
@@ -536,9 +536,10 @@ async function waitForPRToBeMergeableWithRetries(owner, repo, pullNum, headers) 
     if (pr.mergeable_state === "blocked" || pr.mergeable_state === "unstable") {
       console.log(`Detected mergeable_state=${pr.mergeable_state}. Attempting to handle failed workflows/checks...`);
       const commitSHA = pr.head.sha;
-      const success = await handleFailedWorkflows(owner, repo, commitSHA, headers, 2);
+      const maxRetries = 100;
+      const success = await handleFailedWorkflows(owner, repo, commitSHA, headers, maxRetries);
       if (!success) {
-        console.error("Failed workflows/checks could not be fixed after 2 attempts. Aborting.");
+        console.error(`Failed workflows/checks could not be fixed after ${maxRetries} attempts. Aborting.`);
         return false;
       }
       console.log("Workflows restarted. Re-polling soon...");
