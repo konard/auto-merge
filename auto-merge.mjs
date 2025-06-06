@@ -94,15 +94,15 @@ const argv = yargs(hideBin(process.argv))
     description: 'Skip confirmations for required steps',
     default: false
   })
-  .option('auto-tag', {
+  .option('tag', {
     alias: 't',
     type: 'boolean',
-    description: 'Skip the optional "push tag" confirmation',
-    default: false
+    description: 'Ask to push a new version tag after merge (use --no-tag to skip asking)',
+    default: true
   })
-  .option('no-tag', {
+  .option('auto-tag', {
     type: 'boolean',
-    description: 'Skip tag push entirely (when combined with --auto-approve, no interactive input will be required)',
+    description: 'Automatically push the new version tag without asking (implies --tag)',
     default: false
   })
   .positional('pull_request_url', {
@@ -144,11 +144,12 @@ const argv = yargs(hideBin(process.argv))
 const prUrl = argv._[0];
 const bumpType = argv._[1];
 const autoApprove = argv.autoApprove;
-const autoTag = argv.autoTag;
-const noTag = argv.noTag;
+const shouldAskAboutTag = argv.tag;  // whether to ask about tag
+const autoTag = argv.autoTag;        // whether to auto-push tag
+const noTag = !argv.tag;             // inverse of shouldAskAboutTag
 
 debug(
-  `Parsed arguments: prUrl=${prUrl}, bumpType=${bumpType}, autoApprove=${autoApprove}, autoTag=${autoTag}, noTag=${noTag}`
+  `Parsed arguments: prUrl=${prUrl}, bumpType=${bumpType}, autoApprove=${autoApprove}, shouldAskAboutTag=${shouldAskAboutTag}, autoTag=${autoTag}, noTag=${noTag}`
 );
 
 // Extract owner, repo, and pull request number from the URL.
@@ -288,15 +289,21 @@ async function pushCurrentBranch(branchName) {
 }
 
 async function pushNewTag() {
+  // If --no-tag is specified, don't do anything
+  if (noTag) {
+    console.log("Skipping tag push (--no-tag specified).");
+    return;
+  }
+
   const localPkg = getLocalPackageJson();
   const tagName = `v${localPkg.version}`;
 
   // create the tag locally if it doesn't exist
   try {
     execSync(`git rev-parse -q --verify refs/tags/${tagName}`, { stdio: "ignore" });
-    debug(`Local tag ${tagName} already exists.`);
+    debugGit(`Local tag ${tagName} already exists.`);
   } catch {
-    debug(`Local tag ${tagName} not found; creating it.`);
+    debugGit(`Local tag ${tagName} not found; creating it.`);
     await runCommand(`git tag ${tagName}`, {
       dangerous: true,
       description: `Create local tag ${tagName}`,
@@ -305,7 +312,7 @@ async function pushNewTag() {
 
   const cmd = `git push origin ${tagName}`;
   const description = `This will push the new tag ${tagName} to origin.`;
-  debug(`Pushing new tag ${tagName} to origin.`);
+  debugGit(`Pushing new tag ${tagName} to origin.`);
   await runCommand(cmd, { dangerous: true, description });
   console.log(`Tag ${tagName} pushed successfully.`);
 }
@@ -744,19 +751,26 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
         dangerous: true,
         description: `Pulling latest changes for branch ${defaultBranch}`,
       });
+      
+      // Handle tag push based on flags
       if (noTag) {
         console.log("Skipping tag push (--no-tag specified).");
-      } else {
+      } else if (autoTag) {
+        console.log("Auto-pushing tag (--auto-tag specified)...");
+        await pushNewTag();
+      } else if (shouldAskAboutTag) {
         const pushTag = await confirmAction(
           "Do you want to push the new tag to the default branch?",
           "git push origin v<new-tag>",
-          autoTag            // auto-approve only if --auto-tag supplied
+          false  // Never auto-approve tag push unless --auto-tag is specified
         );
         if (pushTag) {
           await pushNewTag();
         } else {
           console.log("Skipping tag push.");
         }
+      } else {
+        console.log("Skipping tag push (--no-tag specified).");
       }
       process.exit(0);
     }
@@ -812,24 +826,31 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
     const mergeResult = await mergePullRequest();
     if (mergeResult.merged) {
       console.log("Pull request merged successfully!");
-      debug("Merge result: " + JSON.stringify(mergeResult));
+      debugMain("Merge result: " + JSON.stringify(mergeResult));
+      
+      // Handle tag push based on flags
       if (noTag) {
         console.log("Skipping tag push (--no-tag specified).");
-      } else {
+      } else if (autoTag) {
+        console.log("Auto-pushing tag (--auto-tag specified)...");
+        await pushNewTag();
+      } else if (shouldAskAboutTag) {
         const pushTag = await confirmAction(
           "Do you want to push the new tag to the default branch?",
           "git push origin v<new-tag>",
-          autoTag            // auto-approve only if --auto-tag supplied
+          false  // Never auto-approve tag push unless --auto-tag is specified
         );
         if (pushTag) {
           await pushNewTag();
         } else {
           console.log("Skipping tag push.");
         }
+      } else {
+        console.log("Skipping tag push (--no-tag specified).");
       }
     } else {
       console.error("Merge failed:", mergeResult.message);
-      debug("Merge response:", JSON.stringify(mergeResult, null, 2));
+      debugMain("Merge response:", JSON.stringify(mergeResult, null, 2));
     }
   } catch (error) {
     console.error("Error:", error.message);
