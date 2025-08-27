@@ -11,3 +11,5 @@
 !auto-merge.mjs
 !test-auto-merge.mjs
 !purge-from-history.sh
+!delete-repos.sh
+!list-test-repos.sh
