@@ -74,14 +74,22 @@ dotenv.config();
 debugConfig("Environment variables loaded.");
 
 // ---------------------
-// Check required environment variable: GITHUB_TOKEN
+// Get GitHub token from environment or gh CLI
 // ---------------------
-const token = process.env.GITHUB_TOKEN;
+let token = process.env.GITHUB_TOKEN;
 if (!token) {
-  console.error("Error: Please set GITHUB_TOKEN as an environment variable.");
-  process.exit(1);
+  debugConfig("GITHUB_TOKEN not found in environment, trying gh CLI...");
+  try {
+    token = execSync("gh auth token", { encoding: "utf8", stdio: "pipe" }).trim();
+    debugConfig("Successfully obtained token from gh CLI.");
+  } catch (err) {
+    console.error("Error: Please set GITHUB_TOKEN as an environment variable or authenticate with 'gh auth login'.");
+    debugConfig(`Failed to get token from gh CLI: ${err.message}`);
+    process.exit(1);
+  }
+} else {
+  debugConfig("GITHUB_TOKEN found in environment.");
 }
-debugConfig("GITHUB_TOKEN is set.");
 
 // ---------------------
 // Configuration and Input Parsing with yargs
@@ -104,6 +112,11 @@ const argv = yargs(hideBin(process.argv))
     type: 'boolean',
     description: 'Automatically push the new version tag without asking (implies --tag)',
     default: false
+  })
+  .option('version-bump', {
+    type: 'boolean',
+    description: 'Perform automatic version bump with yarn version (use --no-version-bump to disable)',
+    default: true
   })
   .positional('pull_request_url', {
     type: 'string',
@@ -147,9 +160,10 @@ const autoApprove = argv.autoApprove;
 const shouldAskAboutTag = argv.tag;  // whether to ask about tag
 const autoTag = argv.autoTag;        // whether to auto-push tag
 const noTag = !argv.tag;             // inverse of shouldAskAboutTag
+const shouldVersionBump = argv.versionBump;  // whether to perform version bump
 
 debug(
-  `Parsed arguments: prUrl=${prUrl}, bumpType=${bumpType}, autoApprove=${autoApprove}, shouldAskAboutTag=${shouldAskAboutTag}, autoTag=${autoTag}, noTag=${noTag}`
+  `Parsed arguments: prUrl=${prUrl}, bumpType=${bumpType}, autoApprove=${autoApprove}, shouldAskAboutTag=${shouldAskAboutTag}, autoTag=${autoTag}, noTag=${noTag}, shouldVersionBump=${shouldVersionBump}`
 );
 
 // Extract owner, repo, and pull request number from the URL.
@@ -797,8 +811,14 @@ async function syncBranchWithDefault(defaultBranch, prBranchName) {
       } else {
         console.log("No changes from merge. Skipping dependency update.");
       }
-      console.log(`Bumping version using "${bumpType}"...`);
-      await bumpLocalVersionSafe(bumpType);
+      
+      if (shouldVersionBump) {
+        console.log(`Bumping version using "${bumpType}"...`);
+        await bumpLocalVersionSafe(bumpType);
+      } else {
+        console.log("Skipping version bump (--no-version-bump specified).");
+      }
+      
       await pushCurrentBranch(prBranchName);
     } else {
       console.log(

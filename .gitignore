@@ -9,4 +9,5 @@
 !LICENSE
 !README.md
 !auto-merge.mjs
+!test-auto-merge.mjs
 !purge-from-history.sh
