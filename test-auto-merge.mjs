@@ -84,6 +84,7 @@ class TestRepository {
     this.localPath = path.join(process.cwd(), name);
     this.url = `https://github.com/${GITHUB_USERNAME}/${name}`;
     this.cloneUrl = `https://github.com/${GITHUB_USERNAME}/${name}.git`;
+    this.wasCreated = false; // Track if repository was actually created
   }
 
   async create() {
@@ -116,6 +117,7 @@ class TestRepository {
     await runCommand(`git commit -m "Initial commit"`);
     await runCommand("git push origin main");
     
+    this.wasCreated = true; // Mark as successfully created
     debug(`Test repository created successfully: ${this.url}`);
   }
 
@@ -162,6 +164,14 @@ class TestRepository {
   }
 
   async cleanup() {
+    // Only show cleanup messages if there's actually something to clean up
+    const hasLocalDir = fs.existsSync(this.localPath);
+    
+    if (!this.wasCreated && !hasLocalDir) {
+      // Nothing was created, nothing to clean up
+      return;
+    }
+    
     debug(`Cleaning up test repository: ${this.name}`);
     
     // Go back to parent directory
@@ -169,17 +179,14 @@ class TestRepository {
     
     try {
       // Remove local directory
-      if (fs.existsSync(this.localPath)) {
+      if (hasLocalDir) {
         await runCommand(`rm -rf "${this.localPath}"`, { silent: true });
         debug(`Local directory removed: ${this.localPath}`);
       }
       
-      // Only try to delete GitHub repository if it was actually created (has the specific test prefix and timestamp)
-      if (this.name.startsWith('auto-merge-test-') && this.name.includes('-') && this.name.length > 20) {
+      // Only try to delete GitHub repository if it was actually created
+      if (this.wasCreated && this.name.startsWith('auto-merge-test-') && this.name.includes('-') && this.name.length > 20) {
         try {
-          // Check if repository exists before trying to delete
-          await runCommand(`gh repo view ${GITHUB_USERNAME}/${this.name}`, { silent: true });
-          
           // Extra safety check: only delete if created very recently (within last hour)
           const timestampMatch = this.name.match(/auto-merge-test-(\d+)/);
           if (timestampMatch) {
@@ -190,7 +197,7 @@ class TestRepository {
             if (currentTimestamp - repoTimestamp < hourInMs) {
               // Try to delete GitHub repository
               await runCommand(`gh repo delete ${GITHUB_USERNAME}/${this.name} --yes`, { silent: true });
-              debug(`GitHub repository deleted: ${this.name}`);
+              debug(`GitHub repository deleted successfully: ${this.name}`);
             } else {
               debug(`Skipping deletion of old test repository: ${this.name}`);
             }
@@ -198,8 +205,8 @@ class TestRepository {
         } catch (deleteErr) {
           if (deleteErr.message.includes('delete_repo')) {
             debug(`Skipping GitHub repository deletion - insufficient permissions: ${this.name}`);
-          } else if (deleteErr.message.includes('Not Found')) {
-            debug(`GitHub repository not found (may not have been created): ${this.name}`);
+          } else if (deleteErr.message.includes('Not Found') || deleteErr.message.includes('Could not resolve to a Repository')) {
+            debug(`GitHub repository not found during cleanup: ${this.name}`);
           } else {
             debug(`Warning: Could not delete GitHub repository ${this.name}: ${deleteErr.message}`);
           }
@@ -245,7 +252,11 @@ class TestSuite {
       this.results.push({ name: testName, status: 'FAILED', error: err.message });
     } finally {
       await testRepo.cleanup();
-      await sleep(2000); // Rate limiting
+      
+      // Only sleep if the test actually used GitHub API (created a repository)
+      if (testRepo.wasCreated) {
+        await sleep(2000); // Rate limiting for GitHub API
+      }
     }
   }
 
