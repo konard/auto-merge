@@ -169,6 +169,11 @@ debug(
 // Extract owner, repo, and pull request number from the URL.
 const prRegex = /^https:\/\/github\.com\/([^\/]+)\/([^\/]+)\/pull\/(\d+)/;
 const match = prUrl.match(prRegex);
+if (!match) {
+  console.error(`Error: Invalid pull request URL format: ${prUrl}`);
+  console.error('Expected format: https://github.com/owner/repo/pull/123');
+  process.exit(1);
+}
 const [, owner, repo, pullNumber] = match;
 debug(`Parsed PR URL: owner=${owner}, repo=${repo}, pullNumber=${pullNumber}`);
 
